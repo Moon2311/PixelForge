@@ -18,8 +18,8 @@
 -- Owner role: full database administration (migrations, schema changes)
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'product_catalog_owner') THEN
-        CREATE ROLE product_catalog_owner WITH LOGIN PASSWORD 'owner_secret_change_me';
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '3654') THEN
+        CREATE ROLE product_catalog_owner WITH LOGIN PASSWORD '3654';
     END IF;
 END
 $$;
@@ -28,7 +28,7 @@ $$;
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'product_catalog_app') THEN
-        CREATE ROLE product_catalog_app WITH LOGIN PASSWORD 'app_secret_change_me';
+        CREATE ROLE product_catalog_app WITH LOGIN PASSWORD '3654';
     END IF;
 END
 $$;
@@ -37,7 +37,7 @@ $$;
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'product_catalog_readonly') THEN
-        CREATE ROLE product_catalog_readonly WITH LOGIN PASSWORD 'readonly_secret_change_me';
+        CREATE ROLE product_catalog_readonly WITH LOGIN PASSWORD '3654';
     END IF;
 END
 $$;

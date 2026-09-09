@@ -18,16 +18,13 @@ services:
       product-catalog-db:
         condition: service_healthy
     environment:
-      # Django runtime uses the app role (SELECT, INSERT, UPDATE, DELETE)
       - DATABASE_NAME=${DATABASE_NAME:-product_catalog_db}
       - DATABASE_USER=${DATABASE_APP_USER:-product_catalog_app}
       - DATABASE_PASSWORD=${DATABASE_APP_PASSWORD:-app_secret_change_me}
       - DATABASE_HOST=product-catalog-db
       - DATABASE_PORT=5432
-      # Owner role for migrations (created in init script)
       - DATABASE_OWNER_USER=${DATABASE_OWNER_USER:-product_catalog_owner}
       - DATABASE_OWNER_PASSWORD=${DATABASE_OWNER_PASSWORD:-owner_secret_change_me}
-      # Elasticsearch
       - ELASTICSEARCH_HOSTS=${ELASTICSEARCH_HOSTS:-http://elasticsearch:9200}
       - ELASTICSEARCH_TIMEOUT=${ELASTICSEARCH_TIMEOUT:-30}
       - ELASTICSEARCH_USER=${ELASTICSEARCH_USER:-elastic}
@@ -39,12 +36,52 @@ services:
       retries: 5
       start_period: 30s
 
+  cart-service:
+    build:
+      context: .
+      dockerfile: cart-service/Dockerfile
+    ports:
+      - "8003:8003"
+    depends_on:
+      cart-db:
+        condition: service_healthy
+    environment:
+      - DATABASE_NAME=cart_db
+      - DATABASE_USER=cart_app
+      - DATABASE_PASSWORD=cart_secret_change_me
+      - DATABASE_HOST=cart-db
+      - DATABASE_PORT=5432
+      - SEARCH_SERVICE_URL=http://search-service:8001
+    healthcheck:
+      test: ["CMD", "python", "-c", "import django; import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from django.db import connection; connection.ensure_connection()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  cart-db:
+    image: postgres:16-alpine
+    ports:
+      - "5441:5432"
+    environment:
+      - POSTGRES_DB=cart_db
+      - POSTGRES_USER=cart_owner
+      - POSTGRES_PASSWORD=owner_secret_change_me
+    volumes:
+      - cart_data:/var/lib/postgresql/data
+      - ./cart-service/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cart_owner -d cart_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   product-catalog-db:
     image: postgres:16-alpine
     ports:
       - "5440:5432"
     environment:
-      # Superuser for initial setup only
       - POSTGRES_DB=${DATABASE_NAME:-product_catalog_db}
       - POSTGRES_USER=${DATABASE_OWNER_USER:-product_catalog_owner}
       - POSTGRES_PASSWORD=${DATABASE_OWNER_PASSWORD:-owner_secret_change_me}
@@ -67,6 +104,8 @@ services:
     depends_on:
       - auth-service
       - search-service
+      - cart-service
 
 volumes:
   product_catalog_data:
+  cart_data:

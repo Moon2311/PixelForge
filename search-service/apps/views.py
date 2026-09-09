@@ -88,7 +88,7 @@ def build_search_query(request):
         should.append(_wildcard_query("name.keyword", value))
 
     for value in _split_csv(brand):
-        should.append(_wildcard_query("brand_name", value))
+        should.append(_wildcard_query("brand_name.keyword", value))
 
     for value in _split_csv(specification):
         for field in ("description", "short_description", "size", "color", "tags"):

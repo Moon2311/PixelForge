@@ -10,8 +10,8 @@ PRODUCT_INDEX = "products"
 
 SORT_FIELDS = {
     "name": "name.keyword",
-    "brand": "brand_name",
-    "category": "category_name",
+    "brand": "brand_name.keyword",
+    "category": "category_name.keyword",
     "sku": "sku",
     "price": "price",
     "stock_quantity": "stock_quantity",
@@ -60,7 +60,6 @@ def ensure_mapping(client):
         properties={
             "cost_price": {"type": "float"},
             "min_stock_alert": {"type": "integer"},
-            "specifications": {"type": "text"},
             "total_sales": {"type": "integer"},
             "flash_sale": {"type": "boolean"},
             "flash_sale_price": {"type": "float"},
@@ -70,7 +69,12 @@ def ensure_mapping(client):
 
 
 def normalize_hit(hit):
-    return {"id": hit["_id"], **hit["_source"]}
+    doc = {"id": hit["_id"], **hit["_source"]}
+    # Flatten nested images to URL list for backward compatibility
+    nested_images = doc.get("images")
+    if isinstance(nested_images, list) and nested_images and isinstance(nested_images[0], dict):
+        doc["images"] = [img.get("url", "") for img in nested_images]
+    return doc
 
 
 def get_product(client, product_id):
@@ -221,11 +225,11 @@ def build_admin_query(params):
 
     category = (params.get("category") or "").strip()
     if category:
-        must.append({"term": {"category_name": category}})
+        must.append({"term": {"category_name.keyword": category}})
 
     brand = (params.get("brand") or "").strip()
     if brand:
-        must.append({"term": {"brand_name": brand}})
+        must.append({"term": {"brand_name.keyword": brand}})
 
     status = (params.get("status") or "").strip()
     if status:
@@ -346,8 +350,8 @@ def get_filter_options(client):
         index=PRODUCT_INDEX,
         size=0,
         aggs={
-            "categories": {"terms": {"field": "category_name", "size": 100}},
-            "brands": {"terms": {"field": "brand_name", "size": 100}},
+            "categories": {"terms": {"field": "category_name.keyword", "size": 100}},
+            "brands": {"terms": {"field": "brand_name.keyword", "size": 100}},
         },
     )
     aggs = resp["aggregations"]

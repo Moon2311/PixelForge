@@ -160,7 +160,7 @@ class Command(BaseCommand):
         self._print_summary(elapsed)
 
         # Step 4: Verify if requested
-        if self.verify and not self.dry_run:
+        if self.verify_only and not self.dry_run:
             self._run_verification()
 
         # Step 5: Switch alias if requested and verification passed
@@ -543,6 +543,9 @@ class Command(BaseCommand):
             product=product, status="approved"
         ).count()
 
+        image_urls = [img["url"] for img in image_docs]
+        flat_price = float(max_price or 0)
+
         return {
             "product_id": product.pk,
             "sku": product.sku,
@@ -554,6 +557,7 @@ class Command(BaseCommand):
             "is_featured": product.is_featured,
             "created_at": product.created_at.isoformat() if product.created_at else None,
             "updated_at": product.updated_at.isoformat() if product.updated_at else None,
+            # Nested objects
             "brand": {
                 "id": brand.pk if brand else None,
                 "name": brand.name if brand else "",
@@ -575,10 +579,10 @@ class Command(BaseCommand):
             "specifications": specifications,
             "images": image_docs,
             "primary_image": primary_image,
-            "price": {
-                "regular": max_price or 0,
-                "min": min_price or 0,
-                "max": max_price or 0,
+            "price_info": {
+                "regular": flat_price,
+                "min": float(min_price or 0),
+                "max": flat_price,
                 "sale": None,
                 "currency": "USD",
             },
@@ -592,6 +596,19 @@ class Command(BaseCommand):
             "color": "",
             "size": "",
             "weight": 0,
+            # Flat compatibility fields for product_store query/sort builders
+            "category_name": category.name if category else "",
+            "brand_name": brand.name if brand else "",
+            "price": flat_price,
+            "stock_quantity": total_stock,
+            "min_stock_alert": 0,
+            "total_sales": 0,
+            "flash_sale": False,
+            "flash_sale_price": None,
+            "flash_sale_ends_at": None,
+            "image_urls": image_urls,
+            "thumbnail": primary_image,
+            "discount_price": None,
         }
 
     # ------------------------------------------------------------------

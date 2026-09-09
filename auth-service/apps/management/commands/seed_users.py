@@ -17,31 +17,28 @@ class Command(BaseCommand):
         users_data = [
             {
                 "username": "admin",
-                "email": "admin@pixelforge.com",
-                "password": "admin123",
+                "email": "talhaabdulsattarnrg@gmail.com",
+                "password": "Admin@123",
                 "role": "admin",
                 "is_staff": True,
+                "is_superuser": True,
             },
             {
-                "username": "buyer",
-                "email": "buyer@pixelforge.com",
-                "password": "buyer123",
-                "role": "buyer",
-            },
-            {
-                "username": "inventory_manager",
-                "email": "inventory@pixelforge.com",
-                "password": "inventory123",
+                "username": "talha",
+                "email": "talhaabdulsattar018@gmail.com",
+                "password": "Talha@pak",
                 "role": "inventory_manager",
+                "is_staff": True,
             },
         ]
 
         for data in users_data:
             role_name = data.pop("role")
             is_staff = data.pop("is_staff", False)
+            is_superuser = data.pop("is_superuser", False)
             user, created = User.objects.get_or_create(
                 username=data["username"],
-                defaults={**data, "is_staff": is_staff},
+                defaults={**data, "is_staff": is_staff, "is_superuser": is_superuser},
             )
             if created:
                 user.set_password(data["password"])

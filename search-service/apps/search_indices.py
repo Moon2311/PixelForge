@@ -220,6 +220,10 @@ PRODUCT_MAPPING: dict[str, Any] = {
                 "type": "keyword",
                 "index": False,
             },
+            "image_urls": {
+                "type": "keyword",
+                "index": False,
+            },
             "price": {
                 "type": "object",
                 "properties": {
@@ -256,6 +260,26 @@ PRODUCT_MAPPING: dict[str, Any] = {
                 "type": "scaled_float",
                 "scaling_factor": 100,
             },
+            # Flat compatibility fields for product_store query/sort builders
+            "category_name": {
+                "type": "text",
+                "fields": {"keyword": {"type": "keyword"}},
+            },
+            "brand_name": {
+                "type": "text",
+                "fields": {"keyword": {"type": "keyword"}},
+            },
+            "price": {
+                "type": "scaled_float",
+                "scaling_factor": 100,
+            },
+            "stock_quantity": {"type": "integer"},
+            "min_stock_alert": {"type": "integer"},
+            "total_sales": {"type": "integer"},
+            "flash_sale": {"type": "boolean"},
+            "flash_sale_price": {"type": "scaled_float", "scaling_factor": 100},
+            "flash_sale_ends_at": {"type": "date"},
+            "discount_price": {"type": "scaled_float", "scaling_factor": 100},
         },
     },
 }

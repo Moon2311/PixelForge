@@ -16,6 +16,11 @@ def get_elasticsearch_client() -> Elasticsearch:
         "timeout": getattr(settings, "ELASTICSEARCH_TIMEOUT", 30),
     }
 
+    # ponytail: skip cert verification for self-signed/local dev certs
+    if hosts and hosts[0].startswith("https://"):
+        kwargs["verify_certs"] = False
+        kwargs["ssl_show_warn"] = False
+
     if hasattr(settings, "ELASTICSEARCH_USER") and hasattr(settings, "ELASTICSEARCH_PASSWORD"):
         kwargs["basic_auth"] = (settings.ELASTICSEARCH_USER, settings.ELASTICSEARCH_PASSWORD)
 
