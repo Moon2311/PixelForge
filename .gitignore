@@ -92,3 +92,10 @@ ENV/
 
 # ruff
 .ruff_cache/
+
+# Keep the example env file
+!.env.example
+
+# Django
+media/
+staticfiles/

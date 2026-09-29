@@ -1,111 +1,45 @@
-version: "3.9"
-
+# Development environment: `docker compose up --build`
+# Backend (all modules) on http://localhost:8000, PostgreSQL on localhost:5433.
 services:
-  auth-service:
-    build:
-      context: .
-      dockerfile: auth-service/Dockerfile
+  backend:
+    build: .
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py runserver 0.0.0.0:8000"
     ports:
-      - "8001:8000"
-
-  search-service:
-    build:
-      context: .
-      dockerfile: search-service/Dockerfile
-    ports:
-      - "8002:8001"
-    depends_on:
-      product-catalog-db:
-        condition: service_healthy
+      - "8000:8000"
     environment:
-      - DATABASE_NAME=${DATABASE_NAME:-product_catalog_db}
-      - DATABASE_USER=${DATABASE_APP_USER:-product_catalog_app}
-      - DATABASE_PASSWORD=${DATABASE_APP_PASSWORD:-app_secret_change_me}
-      - DATABASE_HOST=product-catalog-db
-      - DATABASE_PORT=5432
-      - DATABASE_OWNER_USER=${DATABASE_OWNER_USER:-product_catalog_owner}
-      - DATABASE_OWNER_PASSWORD=${DATABASE_OWNER_PASSWORD:-owner_secret_change_me}
-      - ELASTICSEARCH_HOSTS=${ELASTICSEARCH_HOSTS:-http://elasticsearch:9200}
-      - ELASTICSEARCH_TIMEOUT=${ELASTICSEARCH_TIMEOUT:-30}
-      - ELASTICSEARCH_USER=${ELASTICSEARCH_USER:-elastic}
-      - ELASTICSEARCH_PASSWORD=${ELASTICSEARCH_PASSWORD:-changeme}
+      DATABASE_URL: postgres://pixelforge:pixelforge@postgres:5432/pixelforge
+      SECRET_KEY: ${SECRET_KEY:-django-insecure-docker-dev-only}
+      DEBUG: "True"
+      PASSWORD_RESET_URL: ${PASSWORD_RESET_URL:-http://localhost:5173/reset-password}
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import django; import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from django.db import connection; connection.ensure_connection()"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/')"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
 
-  cart-service:
-    build:
-      context: .
-      dockerfile: cart-service/Dockerfile
-    ports:
-      - "8003:8003"
-    depends_on:
-      cart-db:
-        condition: service_healthy
-    environment:
-      - DATABASE_NAME=cart_db
-      - DATABASE_USER=cart_app
-      - DATABASE_PASSWORD=cart_secret_change_me
-      - DATABASE_HOST=cart-db
-      - DATABASE_PORT=5432
-      - SEARCH_SERVICE_URL=http://search-service:8001
-    healthcheck:
-      test: ["CMD", "python", "-c", "import django; import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from django.db import connection; connection.ensure_connection()"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-
-  cart-db:
+  postgres:
     image: postgres:16-alpine
-    ports:
-      - "5441:5432"
     environment:
-      - POSTGRES_DB=cart_db
-      - POSTGRES_USER=cart_owner
-      - POSTGRES_PASSWORD=owner_secret_change_me
-    volumes:
-      - cart_data:/var/lib/postgresql/data
-      - ./cart-service/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cart_owner -d cart_db"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-
-  product-catalog-db:
-    image: postgres:16-alpine
+      POSTGRES_DB: pixelforge
+      POSTGRES_USER: pixelforge
+      POSTGRES_PASSWORD: pixelforge
     ports:
-      - "5440:5432"
-    environment:
-      - POSTGRES_DB=${DATABASE_NAME:-product_catalog_db}
-      - POSTGRES_USER=${DATABASE_OWNER_USER:-product_catalog_owner}
-      - POSTGRES_PASSWORD=${DATABASE_OWNER_PASSWORD:-owner_secret_change_me}
+      - "5433:5432"
     volumes:
-      - product_catalog_data:/var/lib/postgresql/data
-      - ./search-service/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_OWNER_USER:-product_catalog_owner} -d ${DATABASE_NAME:-product_catalog_db}"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U pixelforge -d pixelforge"]
+      interval: 5s
       timeout: 5s
-      retries: 5
-      start_period: 10s
-
-  nginx:
-    image: nginx:latest
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf
-    ports:
-      - "80:80"
-    depends_on:
-      - auth-service
-      - search-service
-      - cart-service
+      retries: 10
 
 volumes:
-  product_catalog_data:
-  cart_data:
+  postgres_data:

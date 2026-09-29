@@ -1,241 +1,252 @@
 # PixelForge Backend
 
-Backend for PixelForge — Django REST Framework microservices behind an nginx gateway.
-
-## Architecture
+Backend for PixelForge: a **modular monolith**. One Django project and one
+process serve every module (authentication, catalog, search, cart) from
+**one PostgreSQL database**. PostgreSQL handles both the transactional data
+and all search, filtering, sorting and faceting.
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Client (Browser / SPA)                      │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           │  /api/auth/*
-                           │  /api/products/*
+                 React frontend
+                        │
+                        ▼
+            Django modular monolith :8000
+                        │
+     ┌──────────────┬───┴──────────┬──────────────┐
+     ▼              ▼              ▼              ▼
+Authentication   Catalog  ◄──── Search          Cart
+     │              ▲              │              │
+     │              └─ in-process calls (no HTTP) ┘
+     └──────────────┴──────┬───────┴──────────────┘
                            ▼
-              ┌────────────────────────┐
-              │     nginx gateway      │
-              │       :80              │
-              │  (Docker, proxy)       │
-              └────────┬───────────────┘
-                       │
-            ┌──────────▼───────────┐
-            │   auth-service       │       ┌──────────────────────┐
-            │   Django DRF :8001   │◄──────│  PostgreSQL :5432    │
-            │   (Docker container)  │       │  DB: pixelforge      │
-            │                       │       │  User, Role, Profile │
-            └──────────┬───────────┘       └──────────────────────┘
-                       │
-                       │  SharedTokenAuthentication
-                       │  (SHARED_AUTH_SECRET, Bearer)
-                       │
-            ┌──────────▼───────────┐       ┌──────────────────────────┐
-             │  search-service     │◄──────│  Elasticsearch           │
-            │  Django DRF :8002    │       │  products index          │
-            │  (Docker container)   │       │  + SQLite (logs/alerts)  │
-            │                       │       └──────────────────────────┘
-            └───────────────────────┘
+                      PostgreSQL
+            (transactions + search/filtering)
 ```
 
-### Key design decisions
+There is no Elasticsearch, message broker, Redis/Celery or internal HTTP
+between modules.
 
-| Concern | Decision |
-|---------|----------|
-| **API gateway** | nginx routes `/api/auth/*` → auth-service and `/api/products/*` → search-service. Single entry point for all clients. |
-| **Auth service** | Own Django project backed by PostgreSQL. Manages users, roles (`admin`, `buyer`, `inventory_manager`), registration, login, and password reset. Issues shared signed access tokens (`access_token`, 8h TTL, payload `id:role:is_staff`). |
-| **Product service** | Own Django project backed by SQLite (ORM for `InventoryLog`/`LowStockAlert` rows) and Elasticsearch (all product data). Elasticsearch enables full-text search, filtering, sorting, and pagination at scale. |
-| **Shared auth** | Both services share `SHARED_AUTH_SECRET` to sign/verify JWT-like access tokens. The search-service uses `SharedTokenAuthentication` (Bearer header) to authenticate admin requests. No token → 401; non-admin role → 403. |
-| **Deployment** | All services run in Docker containers orchestrated by `docker-compose`. Each service runs gunicorn as the WSGI server. |
-| **CORS** | Open (`CORS_ALLOW_ALL_ORIGINS = True`) in auth-service for local dev. |
-| **Uniform responses** | All endpoints return `{message, status_code, data}` via the `APIResponse` wrapper. |
+## Quick start
 
-### Request flow
-
-1. Client sends request to nginx (`:80`).
-2. nginx proxies to the correct upstream service based on path prefix.
-3. **Auth requests** (`/api/auth/*`) → auth-service validates against PostgreSQL, returns `APIResponse`.
-4. **Product requests** (`/api/products/*`) → search-service:
-   - Public endpoints (list, detail, meta) query Elasticsearch directly.
-   - Admin endpoints verify the shared access token via `SharedTokenAuthentication`.
-   - Writes (create/update/delete/stock) also write `InventoryLog` rows to SQLite and may create/resolve `LowStockAlert` rows.
-5. Response flows back through nginx to the client.
-
-## Structure
-
-```
-PixelForgebackend/
-├── .venv/                       # Python virtual environment (git-ignored)
-├── README.md
-├── docker-compose.yml
-├── requirements.txt
-├── nginx/
-│   └── nginx.conf               # Gateway: /api/auth/ and /api/products/ → services
-├── auth-service/                # Authentication microservice (PostgreSQL)
-│   ├── Dockerfile               # gunicorn on :8000
-│   ├── manage.py
-│   ├── db.sqlite3               # Present but not used (settings use PostgreSQL)
-│   ├── config/
-│   │   ├── settings.py          # DB, CORS, DRF
-│   │   └── urls.py              # Root URLconf → /api/auth/
-│   └── apps/
-│       ├── models.py            # Role, UserProfile
-│       ├── serializers.py       # Register / login / password-reset serializers
-│       ├── views.py             # Auth API views
-│       ├── urls.py              # /api/auth/* routes
-│       ├── responses.py         # Uniform APIResponse wrapper
-│       ├── admin.py, apps.py, tests.py
-│       ├── management/commands/seed_users.py   # Roles + demo users
-│       └── migrations/0001_initial.py
-└── search-service/             # Product microservice (SQLite + Elasticsearch)
-    ├── Dockerfile               # gunicorn on :8001
-    ├── manage.py
-    ├── db.sqlite3
-    ├── .env / .env.example      # Elasticsearch connection config
-    ├── config/
-    │   ├── settings.py          # SQLite DB, Elasticsearch via django-environ
-    │   └── urls.py              # /api/products/
-    └── apps/
-        ├── elasticsearch.py     # get_elasticsearch_client() (cached client)
-        ├── product_store.py     # ES mapping, doc building, admin query/sort/pagination
-        ├── authentication.py    # SharedTokenAuthentication (Bearer) + decode_access_token
-        ├── permissions.py       # IsAdmin permission (role == "admin")
-        ├── serializers.py       # ProductSerializer + Stock/Log/Alert serializers
-        ├── views.py             # Product CRUD, stock, history, inventory, low-stock views
-        ├── models.py            # InventoryLog, LowStockAlert
-        ├── urls.py              # /api/products/* routes
-        └── admin.py, apps.py, tests.py
-```
-
-## Services & endpoints
-
-### auth-service → `http://localhost:8001`
-
-| Method | Endpoint                         | Purpose                                  | Auth |
-|--------|----------------------------------|------------------------------------------|------|
-| POST   | `/api/auth/register/buyer/`      | Register a buyer account                 | Public |
-| POST   | `/api/auth/create/inventory-manager/` | Create an inventory manager          | Admin |
-| POST   | `/api/auth/login/`               | Log in with **username or email**        | Public |
-| POST   | `/api/auth/forgot-password/`     | Generate a reset token for a buyer       | Public |
-| POST   | `/api/auth/reset-password/`      | Set a new password using user_id + token | Public |
-
-All responses use a uniform shape from `APIResponse`:
-
-```json
-{ "message": "...", "status_code": 200, "data": { ... } }
-```
-
-### search-service → `http://localhost:8002`
-
-All product data lives in the Elasticsearch `products` index; writes index/refresh immediately. The Django ORM is used only for `InventoryLog` and `LowStockAlert` rows.
-
-| Method | Endpoint                               | Purpose                                      | Auth |
-|--------|----------------------------------------|----------------------------------------------|------|
-| GET    | `/api/products/`                       | List / search / filter / sort / paginate     | Public |
-| GET    | `/api/products/meta/`                  | Filter options `{categories, brands}`        | Public |
-| POST   | `/api/products/`                       | Create a product (multipart)                 | Admin |
-| GET    | `/api/products/<id>/`                  | Retrieve a single product                    | Public |
-| PUT    | `/api/products/<id>/`                  | Full update (multipart)                      | Admin |
-| PATCH  | `/api/products/<id>/`                  | Partial update                               | Admin |
-| DELETE | `/api/products/<id>/`                  | Delete a product (removes open low-stock alerts) | Admin |
-| PATCH  | `/api/products/<id>/stock/`            | Adjust stock (`stock_quantity` or `delta`, optional `note`) | Admin |
-| GET    | `/api/products/<id>/stock/history/`    | Stock movement history for one product       | Public |
-| GET    | `/api/products/inventory/logs/`        | Inventory movement logs (filter `product_id`, `action`) | Public |
-| GET    | `/api/products/inventory/low-stock/`   | Low-stock alerts (`all=1` includes resolved) | Public |
-| PATCH  | `/api/products/inventory/low-stock/<id>/resolve/` | Mark an alert resolved               | Admin |
-
-**Admin auth:** the auth-service issues a shared signed access token at login (`access_token` in the
-login response, payload `id:role:is_staff`, 8h TTL). The search-service verifies it via
-`SharedTokenAuthentication` (Bearer header, `SHARED_AUTH_SECRET` in both services). No/invalid token → **401**,
-valid token with a non-`admin` role → **403**. The catalogue (list/detail/meta) is public — same data the
-storefront shows; all create/update/delete/stock changes and the stock history, movement logs and
-low-stock endpoints require an admin token.
-
-#### Public search (GET `/api/products/`)
-
-With no query parameters the full catalogue is returned. When any of `page/page_size/search/category/
-brand/stock_status/min_price/max_price/status/sort` is present, admin-style list mode is used (search +
-term filters + price range + sort + pagination).
-
-| Param           | Example                              | Behavior                                             |
-|-----------------|--------------------------------------|------------------------------------------------------|
-| `name` (or `q`) | `?name=iphone`                       | OR wildcard match against name / brand / specification (storefront) |
-| `brand`         | `?brand=Apple` / `?brand=Apple,Samsung` | Case-insensitive partial match against brand name    |
-| `specification` | `?specification=5G` / `?specification=5G,SSD` | Case-insensitive partial match against description, short description, size, color and tags |
-| `search`        | `?search=samsung`                    | Wildcard match against name keyword / brand / SKU    |
-| `category` / `brand` | `?category=Smartphones`          | Term filter (exact)                                  |
-| `status`        | `?status=active`                     | Term filter (`active`/`inactive`/`draft`)            |
-| `stock_status`  | `?stock_status=in_stock`             | `in_stock`/`low_stock`/`out_of_stock` (scripted)     |
-| `min_price`/`max_price` | `?min_price=100&max_price=1000` | Price range filter                                   |
-| `sort`          | `?sort=-price`                       | `price`, `name`, `created_at`, `updated_at`, `stock_quantity` (±) |
-| `page`/`page_size` | `?page=2&page_size=10`           | Pagination; response has `count/results/page/page_size/total_pages/has_next/has_previous` |
-
-#### Stock rules
-
-- Negative stock is coerced to `0`.
-- When `0 < stock_quantity <= min_stock_alert`, a `LowStockAlert` is created automatically; restocking
-  above the threshold auto-resolves it.
-- `status` (active/inactive/draft) is independent of stock; stock display is derived from quantity
-  (>0 in stock, ==0 out of stock, <=min low stock).
-- Every create/update/delete/stock change writes an `InventoryLog` (before/after/change/actor/note).
-
-#### Images
-
-Uploaded via multipart `images` files (jpg/jpeg/png/webp, ≤ 5 MB, saved to `MEDIA_ROOT` under
-`products/<uuid>.<ext>` and served at `/media/...` in DEBUG). Existing image URLs may also be passed as
-string `images` fields. `thumbnail` defaults to the first image.
-
-Configured via `.env` (`ELASTICSEARCH_HOSTS`, `ELASTICSEARCH_USER`, `ELASTICSEARCH_PASSWORD`, `ELASTICSEARCH_TIMEOUT`).
-
-## Setup (local dev)
-
-### auth-service
-
-Requirements: Python 3.10+, PostgreSQL running on `localhost:5432`.
+**Docker (one command):**
 
 ```bash
-cd PixelForgebackend/auth-service
-source ../.venv/bin/activate          # or python3 -m venv ../.venv && pip install -r ../requirements.txt
-pip install -r ../requirements.txt
-
-createdb pixelforge                   # create DB pixelforge (user postgres)
-python manage.py migrate
-python manage.py seed_users           # creates roles + demo users
-python manage.py runserver 0.0.0.0:8001
-```
-
-`config/settings.py` points to database `pixelforge` (user `postgres`, password `3654`, port `5432`). CORS is open (`CORS_ALLOW_ALL_ORIGINS = True`) for local development.
-
-### search-service
-
-```bash
-cd PixelForgebackend/search-service
-source ../.venv/bin/activate
-pip install -r ../requirements.txt
-
-cp .env.example .env                  # set your Elasticsearch credentials
-python manage.py runserver 0.0.0.0:8002
-```
-
-Uses SQLite (`db.sqlite3`) and reads Elasticsearch settings from `.env`.
-
-### Demo users (from `seed_users`)
-
-| Username           | Email                  | Password        | Role              |
-|--------------------|------------------------|-----------------|-------------------|
-| `admin`            | admin@pixelforge.com   | `admin123`      | admin             |
-| `buyer`            | buyer@pixelforge.com   | `buyer123`      | buyer             |
-| `inventory_manager`| inventory@pixelforge.com | `inventory123` | inventory_manager |
-
-> Only the `admin` role can create/update/delete products and adjust inventory (others get HTTP 403).
-
-## Docker / nginx
-
-```bash
-cd PixelForgebackend
 docker compose up --build
 ```
 
-- `auth-service` → `http://localhost:8001` (gunicorn on :8000 inside the container)
-- `search-service` → `http://localhost:8002` (gunicorn on :8001 inside the container)
-- `nginx` → `http://localhost:80`, proxying `/api/auth/*` → auth-service:8000 and `/api/products/*` → search-service:8000
+The backend is at `http://localhost:8000` and runs migrations on start. PostgreSQL is published on host port `5433`.
+Seed demo data with:
 
-> Note: nginx.conf expects `search-service:8000`, but the search-service Dockerfile binds gunicorn to `:8001`. Align these (e.g. change the nginx upstream to `search-service:8001`) before using the gateway for products.
-# PixelForge
+```bash
+docker compose exec backend python manage.py seed_users
+docker compose exec backend python manage.py seed_inventory --count 50
+docker compose exec backend python manage.py seed_catalog
+```
+
+**Local (without Docker)** uses [uv](https://docs.astral.sh/uv/) and requires PostgreSQL on `localhost:5432`.
+
+```bash
+uv sync                               # creates .venv from pyproject.toml + uv.lock
+cp .env.example .env                  # set DATABASE_URL / SECRET_KEY
+createdb pixelforge
+uv run manage.py migrate
+uv run manage.py seed_users           # roles + demo users (optional)
+uv run manage.py runserver            # http://localhost:8000
+```
+
+**Tests:** `uv run manage.py test` (needs a PostgreSQL user that can create the test database and the `pg_trgm` extension).
+
+**Dependencies** live in `pyproject.toml` and are pinned in `uv.lock`: `uv add <package>` to add one, `uv lock --upgrade` to refresh.
+
+## Project layout
+
+```
+PixelForge/
+├── manage.py
+├── pyproject.toml, uv.lock   # dependencies (uv)
+├── Dockerfile, docker-compose.yml, .env.example
+├── config/                 # settings.py (one DATABASE_URL), urls.py, wsgi.py, asgi.py
+├── nginx/nginx.conf        # optional production reverse proxy (single upstream)
+├── scripts/
+│   └── merge_legacy_databases.sh   # one-off copy from the old per-service databases
+└── apps/
+    ├── common/             # health check, uniform APIResponse, test_db_connection
+    ├── authentication/     # Role/UserProfile, register/login/logout/password reset,
+    │                       # Bearer token auth (tokens.py, authentication.py), RBAC permissions
+    ├── catalog/            # catalog models, /api/catalog/ viewsets, flat /api/products|
+    │   │                   # categories|brands|banners/ endpoints, inventory, search stats
+    │   ├── selectors.py    # public read API used by other modules (e.g. cart)
+    │   ├── product_store.py / catalog_store.py   # flat endpoint documents <-> models
+    │   ├── inventory.py    # transaction-safe stock changes, logs, low-stock alerts
+    │   └── stats.py        # denormalized price/stock/rating columns (kept in sync)
+    ├── search/             # PostgreSQL search
+    │   ├── filters.py      # keyword/filter/order builders (Q expressions)
+    │   ├── selectors.py    # base querysets
+    │   ├── services.py     # ProductSearch, autocomplete, category/brand search, flat search
+    │   ├── documents.py    # result documents (prefetched, no N+1)
+    │   └── views.py, urls.py
+    └── cart/               # user and guest carts; validates products via catalog.selectors
+```
+
+Dependency direction: `search → catalog`, `cart → catalog.selectors`, and
+everything → `authentication`/`common` for auth and responses. The catalog
+doesn't import cart. Its flat `GET /api/products/` view calls
+`search.services`, since that endpoint is the storefront search.
+
+## API
+
+All paths are unchanged from the microservice version. Only the host
+changed: everything is now served on `:8000`.
+
+| Prefix | Module | Notes |
+|--------|--------|-------|
+| `/api/auth/` | authentication | register, login, logout, password reset |
+| `/api/catalog/` | catalog | DRF CRUD for categories, subcategories, brands, products, variants, images, attributes, specs, prices, inventory, reviews |
+| `/api/search/` | search | `products/`, `autocomplete/`, `categories/`, `brands/` |
+| `/api/products/`, `/api/categories/`, `/api/brands/`, `/api/banners/` | catalog (+search) | flat storefront/admin endpoints used by the React app |
+| `/api/cart/` | cart | user cart (`Bearer`), guest cart (`X-Guest-Session`), merge |
+| `/api/health/` | common | Django + PostgreSQL |
+| `/admin/` | Django admin | |
+
+Responses keep their existing envelopes. The auth and cart modules return
+`{message, status_code, data}`; the catalog and search modules return
+`{message, status, data}`.
+
+### Authentication
+
+| Method | Endpoint | Purpose | Auth |
+|--------|----------|---------|------|
+| POST | `/api/auth/register/buyer/` | Register a buyer | Public |
+| POST | `/api/auth/create/inventory-manager/` | Create an inventory manager | Staff |
+| POST | `/api/auth/login/` | Log in with **username or email**; returns `{user, access_token}` | Public |
+| POST | `/api/auth/logout/` | End the Django session (the client drops its token) | Public |
+| POST | `/api/auth/forgot-password/` | Email a reset link to an active buyer (same response either way) | Public, 5/hour |
+| POST | `/api/auth/reset-password/` | `{uid, token, new_password, confirm_password}` | Public, 5/hour |
+
+- **Access token:** `Authorization: Bearer <access_token>`. The token is
+  signed with `SECRET_KEY` and expires after `ACCESS_TOKEN_MAX_AGE`
+  (default 8h). It only carries the user id. Each request loads the active
+  `User` and its role from the database, so role changes and deactivation
+  apply immediately. It's stateless, so logout can't revoke a token early.
+- **Password reset:** the link is `PASSWORD_RESET_URL?uid=…&token=…`. The
+  tokens come from Django's `default_token_generator`, so they're
+  single-use and expire after `PASSWORD_RESET_TIMEOUT` (1h). Only buyers can
+  reset.
+- **Roles (RBAC):** `admin`, `catalog_manager`, `inventory_manager`,
+  `customer` are enforced by `apps/authentication/permissions.py`, reading
+  `user.profile.role`. `seed_users` creates `admin`, `buyer` and
+  `inventory_manager`; registration assigns `buyer`.
+
+### Search (`/api/search/products/`)
+
+Query params: `q`/`search`, `category_id`, `category` (slug),
+`subcategory_id`, `subcategory`, `brand_id`, `brand` (slug), `min_price`,
+`max_price`, `in_stock`, `is_featured`, `min_rating`, `ordering` (`name`,
+`price`, `rating`, `review_count`, `created_at`, `relevance`, `-` prefix
+for descending), `page`, `page_size` (≤100), `facets`.
+
+**Matching:** every word must appear as a case-insensitive substring
+somewhere in the product: name, SKU (partial SKU/part numbers work),
+descriptions, specification text/values, color, size, tags, brand,
+category or subcategory. Only `active` products are returned unless a
+`status` filter is given. Relevance ranks exact name > name prefix > name
+contains > SKU match. Facets cover categories, subcategories, brands, price
+ranges, ratings and availability.
+
+**Storefront search** (`GET /api/products/?name=…&brand=…&specification=…`)
+matches products where *any* comma-separated term matches, with the same
+fields, and lists name matches first. The admin list mode (`page`, `sort`,
+`stock_status`, … params) is unchanged.
+
+### Cart
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET / DELETE | `/api/cart/` | Get or clear the user's cart (`Bearer`) |
+| POST | `/api/cart/items/` | `{product_id, quantity}`; adds or increments |
+| PATCH / DELETE | `/api/cart/items/<id>/` | Set quantity / remove (own items only) |
+| GET / DELETE | `/api/cart/guest/` | Guest cart for the `X-Guest-Session` header |
+| POST | `/api/cart/guest/items/` | Add to guest cart |
+| PATCH / DELETE | `/api/cart/guest/items/<id>/` | Set quantity (`0` removes) / remove |
+| POST | `/api/cart/merge/` | `{session_id}`: merge a guest cart into the user's cart (qty capped at 99) |
+
+Products are validated in-process through `apps.catalog.selectors.get_product`.
+Unknown or deleted products return `404`.
+
+## How search works on PostgreSQL
+
+Every filter, sort, count and facet is computed inside PostgreSQL. No
+product lists are filtered in Python.
+
+- **Trigram indexes (`pg_trgm`):** substring matching (`UPPER(x) LIKE
+  '%TERM%'`) is index-assisted.
+  - `product_search_trgm` indexes one immutable expression that joins the
+    product's text columns (`catalog.models.product_search_text()`).
+  - `product_name_trgm` serves autocomplete.
+  - `spec_value_trgm` serves specification values.
+- **Related-name matches:** brand, category and subcategory names are
+  resolved to id lists first (small tables). The final `OR` then only
+  contains indexable product-table predicates (`search_text LIKE`,
+  `brand_id IN (…)`, `pk IN (…)`), which PostgreSQL combines with a
+  **BitmapOr**.
+- **Denormalized stats:** `Product.price_min/price_max/in_stock/rating_avg/review_count`
+  replace per-row subqueries for price, stock and rating filters, sorts and
+  facets.
+  - `apps/catalog/stats.py` recomputes them with one set-based `UPDATE`
+    whenever a price, inventory row, variant or review is saved or deleted,
+    in the same transaction.
+  - `manage.py refresh_product_stats` rebuilds them all.
+  - They're indexed as `(status, price_max)` and `(status, rating_avg)`.
+- **Default list sort:** `product_updated_desc_idx` backs the default
+  `updated_at DESC` sort of `GET /api/products/`.
+- **No N+1:** result documents are built from one prefetched queryset per
+  page (variants, prices, inventory, attributes, images, specs).
+
+Measured on 60,000 products (local PostgreSQL 16): keyword queries take 1–7 ms
+with the trigram/BitmapOr plan. A full `/api/search/products/?q=…` page with
+facets takes about 100 ms, and a price-filtered search with no keyword about
+150 ms.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/pixelforge` | The single database |
+| `SECRET_KEY` | dev-only value | Django secret; also signs access tokens |
+| `DEBUG` | `True` | |
+| `ALLOWED_HOSTS` | `*` | Comma-separated |
+| `ACCESS_TOKEN_MAX_AGE` | `28800` | Access-token lifetime (seconds) |
+| `PASSWORD_RESET_URL` | `http://localhost:3000/reset-password` | Frontend reset page |
+| `PASSWORD_RESET_TIMEOUT` | `3600` | Reset-link lifetime (seconds) |
+| `PASSWORD_RESET_THROTTLE_RATE` | `5/hour` | Forgot/reset rate limit |
+| `EMAIL_*`, `DEFAULT_FROM_EMAIL` | console backend | Outgoing email |
+
+## Management commands
+
+| Command | Purpose |
+|---------|---------|
+| `seed_users` | Roles (`admin`, `buyer`, `inventory_manager`) and demo users |
+| `seed_inventory --count N` | Demo products with variants, prices, stock, images, specs |
+| `seed_catalog` | Demo categories, brands, banners; featured/flash-sale flags |
+| `refresh_product_stats` | Rebuild denormalized search stats |
+| `cleanup_guest_carts` | Delete expired guest carts |
+| `setup_rbac` | Django groups/permissions mirroring the roles |
+| `test_db_connection` | Check database connectivity |
+
+## Migrating data from the old per-service databases
+
+The monolith keeps the old table names (`db_table = "apps_<model>"`), so
+rows copy over unchanged:
+
+```bash
+uv run manage.py migrate      # create the schema in the new database
+AUTH_DATABASE_URL=postgres://…/auth-service \
+CATALOG_DATABASE_URL=postgres://…/product_catalog_db \
+CART_DATABASE_URL=postgres://…/cart_db \
+scripts/merge_legacy_databases.sh
+```
+
+The script only reads the source databases, refuses to write into
+non-empty target tables, resets sequences and rebuilds search stats.
+Outbox events aren't copied, because the outbox was removed. Django
+groups/permissions aren't copied either, since their content-type ids
+differ per database; re-run `setup_rbac`.

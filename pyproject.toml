@@ -1,0 +1,18 @@
+[project]
+name = "pixelforge"
+version = "0.1.0"
+description = "PixelForge backend: Django modular monolith on PostgreSQL"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "django==5.2.16",
+    "djangorestframework==3.14.0",
+    "django-cors-headers==4.9.0",
+    "django-environ==0.14.0",
+    "psycopg2-binary==2.9.11",
+    "gunicorn==23.0.0",
+]
+
+[tool.uv]
+# This is an application, not a library: don't build/install it as a package.
+package = false
