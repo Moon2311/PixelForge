@@ -79,6 +79,10 @@ class LoginSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True)
 
 
+class RefreshTokenSerializer(serializers.Serializer):
+    refresh_token = serializers.CharField()
+
+
 def get_password_reset_users(email):
     """Active buyers with a usable password matching the email (case-insensitive)."""
     users = User.objects.filter(

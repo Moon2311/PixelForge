@@ -43,6 +43,8 @@ INSTALLED_APPS = [
     "apps.catalog",
     "apps.search",
     "apps.cart",
+    "apps.orders",
+    "apps.payments",
 ]
 
 MIDDLEWARE = [
@@ -105,9 +107,57 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 # Lifetime of the Bearer access token issued at login (seconds).
-ACCESS_TOKEN_MAX_AGE = env.int("ACCESS_TOKEN_MAX_AGE", default=60 * 60 * 8)
+ACCESS_TOKEN_MAX_AGE = env.int("ACCESS_TOKEN_MAX_AGE", default=60 * 15)
+# Lifetime of the refresh token used to get a new access token (seconds).
+REFRESH_TOKEN_MAX_AGE = env.int("REFRESH_TOKEN_MAX_AGE", default=60 * 60 * 24 * 7)
+
+# Checkout: shown on the checkout page for Bank Deposit and Pickup.
+BANK_DEPOSIT_INSTRUCTIONS = env.str("BANK_DEPOSIT_INSTRUCTIONS", default="")
+PICKUP_LOCATION = env.str("PICKUP_LOCATION", default="")
 
 PASSWORD_RESET_TIMEOUT = env.int("PASSWORD_RESET_TIMEOUT", default=3600)
+
+# ---------------------------------------------------------------------------
+# Online payments (apps.payments) — a provider is offered at checkout only
+# when all of its credentials are set. See README "Online payments".
+# ---------------------------------------------------------------------------
+
+# Storefront page the customer lands on after paying; "?payment_id=<id>" is appended.
+PAYMENT_RESULT_URL = env.str("PAYMENT_RESULT_URL", default="http://localhost:5173/payment/result")
+# How long a payment attempt stays open at the provider (minutes).
+PAYMENT_EXPIRY_MINUTES = env.int("PAYMENT_EXPIRY_MINUTES", default=30)
+# Timeout for server-to-server provider calls (seconds).
+PAYMENT_PROVIDER_TIMEOUT = env.int("PAYMENT_PROVIDER_TIMEOUT", default=20)
+
+# JazzCash Online Payment Gateway (HTTP POST page redirection + Payment Inquiry).
+JAZZCASH_ENVIRONMENT = env.str("JAZZCASH_ENVIRONMENT", default="sandbox")  # sandbox | production
+JAZZCASH_MERCHANT_ID = env.str("JAZZCASH_MERCHANT_ID", default="")
+JAZZCASH_PASSWORD = env.str("JAZZCASH_PASSWORD", default="")
+JAZZCASH_INTEGRITY_SALT = env.str("JAZZCASH_INTEGRITY_SALT", default="")
+# Public HTTPS URL of /api/payments/jazzcash/callback/ (registered with JazzCash).
+JAZZCASH_RETURN_URL = env.str("JAZZCASH_RETURN_URL", default="")
+JAZZCASH_VERSION = env.str("JAZZCASH_VERSION", default="1.1")
+# Empty lets the customer choose on JazzCash; or MWALLET, MIGS, OTC.
+JAZZCASH_TXN_TYPE = env.str("JAZZCASH_TXN_TYPE", default="")
+# Sandbox URLs are built in; production URLs are issued by JazzCash.
+JAZZCASH_CHECKOUT_URL = env.str("JAZZCASH_CHECKOUT_URL", default="")
+JAZZCASH_INQUIRY_URL = env.str("JAZZCASH_INQUIRY_URL", default="")
+
+# Easypaisa / Easypay (hosted checkout + inquire-transaction REST API).
+EASYPAISA_ENVIRONMENT = env.str("EASYPAISA_ENVIRONMENT", default="sandbox")  # sandbox | production
+EASYPAISA_STORE_ID = env.str("EASYPAISA_STORE_ID", default="")
+EASYPAISA_HASH_KEY = env.str("EASYPAISA_HASH_KEY", default="")
+# Partner account used for the REST API's Credentials header.
+EASYPAISA_USERNAME = env.str("EASYPAISA_USERNAME", default="")
+EASYPAISA_PASSWORD = env.str("EASYPAISA_PASSWORD", default="")
+EASYPAISA_ACCOUNT_NUM = env.str("EASYPAISA_ACCOUNT_NUM", default="")
+# Public HTTPS URL of /api/payments/easypaisa/callback/ (the postBackURL).
+EASYPAISA_RETURN_URL = env.str("EASYPAISA_RETURN_URL", default="")
+# MA_PAYMENT_METHOD (mobile account), OTC_PAYMENT_METHOD, CC_PAYMENT_METHOD.
+EASYPAISA_PAYMENT_METHOD = env.str("EASYPAISA_PAYMENT_METHOD", default="MA_PAYMENT_METHOD")
+EASYPAISA_CHECKOUT_URL = env.str("EASYPAISA_CHECKOUT_URL", default="")
+EASYPAISA_CONFIRM_URL = env.str("EASYPAISA_CONFIRM_URL", default="")
+EASYPAISA_INQUIRY_URL = env.str("EASYPAISA_INQUIRY_URL", default="")
 
 # Frontend page that receives the reset link; "?uid=<uid>&token=<token>" is appended.
 PASSWORD_RESET_URL = env.str(
@@ -165,12 +215,14 @@ REST_FRAMEWORK = {
         "rest_framework.parsers.FormParser",
         "rest_framework.parsers.MultiPartParser",
     ],
-    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "DEFAULT_PAGINATION_CLASS": "apps.common.pagination.CustomPagination",
     "PAGE_SIZE": 20,
     "DEFAULT_FILTER_BACKENDS": [
         "rest_framework.filters.SearchFilter",
         "rest_framework.filters.OrderingFilter",
     ],
+    # Every error is answered as apps.common.custom_response.CustomResponse.
+    "EXCEPTION_HANDLER": "apps.common.exceptions.custom_exception_handler",
     "DEFAULT_THROTTLE_RATES": {
         "password_reset": env.str("PASSWORD_RESET_THROTTLE_RATE", default="5/hour"),
     },

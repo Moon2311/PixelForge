@@ -4,15 +4,16 @@ from django.db.models import Q
 from rest_framework.permissions import AllowAny, IsAdminUser
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
-from apps.common.responses import APIResponse
+from apps.common.custom_response import CustomResponse
 
-from .tokens import issue_access_token
+from .tokens import issue_token_pair, user_from_refresh_token
 from .emails import send_password_changed_email, send_password_reset_email
 from .serializers import (
     BuyerRegistrationSerializer,
     ForgotPasswordSerializer,
     InventoryManagerCreateSerializer,
     LoginSerializer,
+    RefreshTokenSerializer,
     ResetPasswordSerializer,
     UserSerializer,
     get_password_reset_users,
@@ -26,8 +27,10 @@ class RegisterBuyerView(APIView):
         serializer = BuyerRegistrationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
-        return APIResponse.created(
-            data=UserSerializer(user).data, message="Buyer registered successfully"
+        return CustomResponse.successful_response(
+            UserSerializer(user).data,
+            "Buyer registered successfully",
+            status=201,
         )
 
 
@@ -38,9 +41,10 @@ class CreateInventoryManagerView(APIView):
         serializer = InventoryManagerCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
-        return APIResponse.created(
-            data=UserSerializer(user).data,
-            message="Inventory manager created successfully",
+        return CustomResponse.successful_response(
+            UserSerializer(user).data,
+            "Inventory manager created successfully",
+            status=201,
         )
 
 
@@ -63,17 +67,30 @@ class LoginView(APIView):
                 request, username=account.username, password=password
             )
         if user is None:
-            return APIResponse.error(
-                message="Invalid username or password", status_code=401
-            )
+            return CustomResponse.failed_response("Invalid username or password", status=401)
         login(request, user)
-        return APIResponse.success(
-            data={
+        return CustomResponse.successful_response(
+            {
                 "user": UserSerializer(user).data,
-                "access_token": issue_access_token(user),
+                **issue_token_pair(user),
             },
-            message="Login successful",
+            "Login successful",
         )
+
+
+class RefreshTokenView(APIView):
+    """POST /api/auth/refresh/ — trade a refresh token for a new token pair."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = RefreshTokenSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = user_from_refresh_token(serializer.validated_data["refresh_token"])
+        if user is None:
+            return CustomResponse.failed_response("Invalid or expired refresh token", status=401)
+        return CustomResponse.successful_response(issue_token_pair(user), "Token refreshed")
 
 
 class ForgotPasswordView(APIView):
@@ -87,8 +104,8 @@ class ForgotPasswordView(APIView):
         for user in get_password_reset_users(serializer.validated_data["email"]):
             send_password_reset_email(user)
         # Same response whether or not the email matched an account.
-        return APIResponse.success(
-            message="If an account exists for this email, a password reset link has been sent."
+        return CustomResponse.successful_response(
+            message="If an account exists for this email, a password reset link has been sent.",
         )
 
 
@@ -102,18 +119,19 @@ class ResetPasswordView(APIView):
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
         send_password_changed_email(user)
-        return APIResponse.success(message="Password reset successfully")
+        return CustomResponse.successful_response(message="Password reset successfully")
 
 
 class LogoutView(APIView):
     """POST /api/auth/logout/ — end the Django session, if any.
 
-    Access tokens are stateless and expire on their own
-    (``ACCESS_TOKEN_MAX_AGE``); clients drop the token on logout.
+    Access and refresh tokens are stateless and expire on their own
+    (``ACCESS_TOKEN_MAX_AGE`` / ``REFRESH_TOKEN_MAX_AGE``); clients drop
+    both tokens on logout.
     """
 
     permission_classes = [AllowAny]
 
     def post(self, request):
         logout(request)
-        return APIResponse.success(message="Logged out")
+        return CustomResponse.successful_response(message="Logged out")

@@ -1,7 +1,8 @@
 from django.db import connection
 from rest_framework import status
-from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from apps.common.custom_response import CustomResponse
 
 
 class HealthCheckView(APIView):
@@ -20,8 +21,11 @@ class HealthCheckView(APIView):
             health["status"] = "unhealthy"
             health["checks"]["database"] = {"status": "error", "message": str(e)}
 
-        status_code = status.HTTP_200_OK if health["status"] == "healthy" else status.HTTP_503_SERVICE_UNAVAILABLE
-        return Response(health, status=status_code)
+        if health["status"] != "healthy":
+            return CustomResponse.failed_response(
+                "Service unhealthy", data=health, status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        return CustomResponse.successful_response(health, "Service healthy")
 
 
 class ApiRootView(APIView):
@@ -31,7 +35,7 @@ class ApiRootView(APIView):
     permission_classes = []
 
     def get(self, request):
-        return Response({
+        return CustomResponse.successful_response({
             "service": "pixelforge",
             "endpoints": {
                 "health": "/api/health/",
@@ -45,4 +49,4 @@ class ApiRootView(APIView):
                 "cart": "/api/cart/",
                 "admin": "/admin/",
             },
-        })
+        }, "PixelForge API")

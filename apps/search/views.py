@@ -11,8 +11,9 @@ import logging
 
 from rest_framework import status
 from rest_framework.permissions import AllowAny
-from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from apps.common.custom_response import CustomResponse
 
 from apps.search.services import (
     CategorySearch,
@@ -140,20 +141,11 @@ class SearchProductsView(APIView):
                 facets=facets,
             )
 
-            return Response({
-                "message": "Success",
-                "status": status.HTTP_200_OK,
-                "data": result,
-            })
+            return CustomResponse.successful_response(result)
         except Exception as e:
             logger.error(f"Search error: {e}", exc_info=True)
-            return Response(
-                {
-                    "message": "Search error",
-                    "status": status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    "data": {"error": str(e)},
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            return CustomResponse.failed_response(
+                "Search error", data={"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
 
@@ -171,31 +163,18 @@ class SearchAutocompleteView(APIView):
         prefix = request.query_params.get("q") or request.query_params.get("prefix", "")
 
         if not prefix or len(prefix) < 2:
-            return Response({
-                "message": "Success",
-                "status": status.HTTP_200_OK,
-                "data": {"suggestions": []},
-            })
+            return CustomResponse.successful_response({"suggestions": []})
 
         try:
             autocomplete = ProductAutocomplete()
 
             suggestions = autocomplete.suggest(prefix)
 
-            return Response({
-                "message": "Success",
-                "status": status.HTTP_200_OK,
-                "data": {"suggestions": suggestions},
-            })
+            return CustomResponse.successful_response({"suggestions": suggestions})
         except Exception as e:
             logger.error(f"Autocomplete error: {e}", exc_info=True)
-            return Response(
-                {
-                    "message": "Autocomplete error",
-                    "status": status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    "data": {"error": str(e)},
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            return CustomResponse.failed_response(
+                "Autocomplete error", data={"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
 
@@ -217,20 +196,11 @@ class SearchCategoriesView(APIView):
 
             categories = search.search(query)
 
-            return Response({
-                "message": "Success",
-                "status": status.HTTP_200_OK,
-                "data": {"categories": categories},
-            })
+            return CustomResponse.successful_response({"categories": categories})
         except Exception as e:
             logger.error(f"Category search error: {e}", exc_info=True)
-            return Response(
-                {
-                    "message": "Search error",
-                    "status": status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    "data": {"error": str(e)},
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            return CustomResponse.failed_response(
+                "Search error", data={"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
 
@@ -252,18 +222,9 @@ class SearchBrandsView(APIView):
 
             brands = search.search(query)
 
-            return Response({
-                "message": "Success",
-                "status": status.HTTP_200_OK,
-                "data": {"brands": brands},
-            })
+            return CustomResponse.successful_response({"brands": brands})
         except Exception as e:
             logger.error(f"Brand search error: {e}", exc_info=True)
-            return Response(
-                {
-                    "message": "Search error",
-                    "status": status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    "data": {"error": str(e)},
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            return CustomResponse.failed_response(
+                "Search error", data={"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )

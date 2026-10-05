@@ -5,7 +5,7 @@ from rest_framework.views import APIView
 
 from apps.authentication.authentication import BearerTokenAuthentication
 from apps.authentication.permissions import IsAuthenticated
-from apps.common.responses import APIResponse
+from apps.common.custom_response import CustomResponse
 
 from .models import CartItem, GuestCart, GuestCartItem
 from .serializers import (
@@ -41,7 +41,7 @@ def serialize_cart(cart):
 def validate_product(product_id):
     """Return an error response if the product doesn't exist, else None."""
     if find_product(product_id) is None:
-        return APIResponse.not_found("Product not found")
+        return CustomResponse.failed_response("Product not found", status=404)
     return None
 
 
@@ -60,14 +60,14 @@ class CartView(CartAPIView):
 
     def get(self, request):
         cart = get_or_create_cart(request.user.id)
-        return APIResponse.success(data=serialize_cart(cart))
+        return CustomResponse.successful_response(serialize_cart(cart))
 
     def delete(self, request):
         cart = get_or_create_cart(request.user.id)
         count = cart.items.count()
         cart.items.all().delete()
         logger.info("Cleared cart for user %s (%d items removed)", request.user.id, count)
-        return APIResponse.success(data=serialize_cart(cart), message="Cart cleared successfully")
+        return CustomResponse.successful_response(serialize_cart(cart), "Cart cleared successfully")
 
 
 class CartItemAddView(CartAPIView):
@@ -105,10 +105,10 @@ class CartItemAddView(CartAPIView):
             created,
         )
 
-        return APIResponse.success(
-            data={"id": item.id, "product_id": item.product_id, "quantity": item.quantity},
-            message="Product added to cart successfully" if created else "Cart item quantity updated",
-            status_code=201 if created else 200,
+        return CustomResponse.successful_response(
+            {"id": item.id, "product_id": item.product_id, "quantity": item.quantity},
+            "Product added to cart successfully" if created else "Cart item quantity updated",
+            status=201 if created else 200,
         )
 
 
@@ -124,10 +124,10 @@ class CartItemDetailView(CartAPIView):
         try:
             item = CartItem.objects.select_related("cart").get(id=item_id)
         except CartItem.DoesNotExist:
-            return None, APIResponse.not_found("Cart item not found")
+            return None, CustomResponse.failed_response("Cart item not found", status=404)
 
         if item.cart.user_id != request.user.id:
-            return None, APIResponse.forbidden("Access denied")
+            return None, CustomResponse.failed_response("Access denied", status=403)
 
         return item, None
 
@@ -144,9 +144,9 @@ class CartItemDetailView(CartAPIView):
 
         logger.info("User %s: updated cart item %s to qty %d", request.user.id, item_id, item.quantity)
 
-        return APIResponse.success(
-            data={"id": item.id, "product_id": item.product_id, "quantity": item.quantity},
-            message="Cart item updated successfully",
+        return CustomResponse.successful_response(
+            {"id": item.id, "product_id": item.product_id, "quantity": item.quantity},
+            "Cart item updated successfully",
         )
 
     def delete(self, request, item_id):
@@ -157,14 +157,14 @@ class CartItemDetailView(CartAPIView):
         item.delete()
         logger.info("User %s: removed cart item %s", request.user.id, item_id)
 
-        return APIResponse.success(message="Cart item removed successfully")
+        return CustomResponse.successful_response(message="Cart item removed successfully")
 
 
 def _get_guest_session(request):
     """Extract and validate X-Guest-Session header. Returns (session_id, None) or (None, error)."""
     session_id = request.headers.get("X-Guest-Session", "").strip()
     if not session_id:
-        return None, APIResponse.error("X-Guest-Session header required")
+        return None, CustomResponse.failed_response("X-Guest-Session header required")
     return session_id, None
 
 
@@ -209,7 +209,7 @@ class GuestCartView(CartAPIView):
             return error
 
         cart = get_or_create_guest_cart(session_id)
-        return APIResponse.success(data=serialize_guest_cart(cart))
+        return CustomResponse.successful_response(serialize_guest_cart(cart))
 
     def delete(self, request):
         session_id, error = _get_guest_session(request)
@@ -219,13 +219,14 @@ class GuestCartView(CartAPIView):
         try:
             cart = GuestCart.objects.get(session_id=session_id)
         except GuestCart.DoesNotExist:
-            return APIResponse.not_found("Guest cart not found")
+            return CustomResponse.failed_response("Guest cart not found", status=404)
 
         count = cart.items.count()
         cart.items.all().delete()
         logger.info("Cleared guest cart %s (%d items removed)", session_id, count)
-        return APIResponse.success(
-            data=serialize_guest_cart(cart), message="Guest cart cleared successfully"
+        return CustomResponse.successful_response(
+            serialize_guest_cart(cart),
+            "Guest cart cleared successfully",
         )
 
 
@@ -276,15 +277,15 @@ class GuestCartItemView(CartAPIView):
             created,
         )
 
-        return APIResponse.success(
-            data={
+        return CustomResponse.successful_response(
+            {
                 "id": item.id,
                 "product_id": item.product_id,
                 "variant_id": item.variant_id,
                 "quantity": item.quantity,
             },
-            message="Item added to guest cart" if created else "Guest cart item quantity updated",
-            status_code=201 if created else 200,
+            "Item added to guest cart" if created else "Guest cart item quantity updated",
+            status=201 if created else 200,
         )
 
     def patch(self, request, pk):
@@ -300,23 +301,23 @@ class GuestCartItemView(CartAPIView):
                 id=pk, cart__session_id=session_id
             )
         except GuestCartItem.DoesNotExist:
-            return APIResponse.not_found("Guest cart item not found")
+            return CustomResponse.failed_response("Guest cart item not found", status=404)
 
         quantity = serializer.validated_data["quantity"]
         if quantity == 0:
             item.delete()
-            return APIResponse.success(message="Guest cart item removed")
+            return CustomResponse.successful_response(message="Guest cart item removed")
 
         item.quantity = quantity
         item.save(update_fields=["quantity"])
-        return APIResponse.success(
-            data={
+        return CustomResponse.successful_response(
+            {
                 "id": item.id,
                 "product_id": item.product_id,
                 "variant_id": item.variant_id,
                 "quantity": item.quantity,
             },
-            message="Guest cart item updated",
+            "Guest cart item updated",
         )
 
     def delete(self, request, pk):
@@ -329,11 +330,11 @@ class GuestCartItemView(CartAPIView):
                 id=pk, cart__session_id=session_id
             )
         except GuestCartItem.DoesNotExist:
-            return APIResponse.not_found("Guest cart item not found")
+            return CustomResponse.failed_response("Guest cart item not found", status=404)
 
         item.delete()
         logger.info("Guest %s: removed cart item %s", session_id, pk)
-        return APIResponse.success(message="Guest cart item removed")
+        return CustomResponse.successful_response(message="Guest cart item removed")
 
 
 class MergeCartView(CartAPIView):
@@ -345,7 +346,7 @@ class MergeCartView(CartAPIView):
     def post(self, request):
         session_id = request.data.get("session_id", "").strip()
         if not session_id:
-            return APIResponse.error("session_id is required")
+            return CustomResponse.failed_response("session_id is required")
 
         # Get authenticated cart
         auth_cart = get_or_create_cart(request.user.id)
@@ -354,9 +355,9 @@ class MergeCartView(CartAPIView):
         try:
             guest_cart = GuestCart.objects.get(session_id=session_id)
         except GuestCart.DoesNotExist:
-            return APIResponse.success(
-                data=serialize_cart(auth_cart),
-                message="No guest cart found — nothing to merge",
+            return CustomResponse.successful_response(
+                serialize_cart(auth_cart),
+                "No guest cart found — nothing to merge",
             )
 
         # Merge items
@@ -383,6 +384,7 @@ class MergeCartView(CartAPIView):
             "Merged guest cart %s into user %s cart", session_id, request.user.id
         )
 
-        return APIResponse.success(
-            data=serialize_cart(auth_cart), message="Guest cart merged successfully"
+        return CustomResponse.successful_response(
+            serialize_cart(auth_cart),
+            "Guest cart merged successfully",
         )

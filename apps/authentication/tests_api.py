@@ -6,7 +6,13 @@ from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from apps.authentication.models import Role, UserProfile
-from apps.authentication.tokens import SALT, issue_access_token, user_from_access_token
+from apps.authentication.tokens import (
+    SALT,
+    issue_access_token,
+    issue_refresh_token,
+    user_from_access_token,
+    user_from_refresh_token,
+)
 
 
 def _user(username, role_name, password="Pass-word-123!", **extra):
@@ -34,6 +40,7 @@ class RegisterAndLoginTest(TestCase):
             data = resp.json()["data"]
             self.assertEqual(data["user"]["username"], "ali")
             self.assertEqual(user_from_access_token(data["access_token"]).username, "ali")
+            self.assertEqual(user_from_refresh_token(data["refresh_token"]).username, "ali")
 
     def test_register_with_blank_last_name(self):
         # The frontend splits a full name; a one-word name sends last_name "".
@@ -78,6 +85,44 @@ class AccessTokenTest(TestCase):
     @override_settings(ACCESS_TOKEN_MAX_AGE=-1)
     def test_expired_token_rejected(self):
         self.assertIsNone(user_from_access_token(issue_access_token(_user("old", "buyer"))))
+
+
+class RefreshTokenTest(TestCase):
+    def refresh(self, token):
+        return self.client.post("/api/auth/refresh/", {"refresh_token": token},
+                                content_type="application/json")
+
+    def test_refresh_returns_new_token_pair(self):
+        user = _user("ali", "buyer")
+        resp = self.refresh(issue_refresh_token(user))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        data = resp.json()["data"]
+        self.assertEqual(user_from_access_token(data["access_token"]), user)
+        self.assertEqual(user_from_refresh_token(data["refresh_token"]), user)
+
+    def test_access_and_refresh_tokens_not_interchangeable(self):
+        user = _user("ali", "buyer")
+        self.assertEqual(self.refresh(issue_access_token(user)).status_code, 401)
+        self.assertIsNone(user_from_access_token(issue_refresh_token(user)))
+
+    def test_rejected_after_password_change_or_deactivation(self):
+        user = _user("ali", "buyer")
+        token = issue_refresh_token(user)
+        user.set_password("New-pass-456!")
+        user.save()
+        self.assertEqual(self.refresh(token).status_code, 401)
+
+        token = issue_refresh_token(user)
+        user.is_active = False
+        user.save()
+        self.assertEqual(self.refresh(token).status_code, 401)
+
+    def test_tampered_refresh_token_rejected(self):
+        self.assertEqual(self.refresh(issue_refresh_token(_user("ali", "buyer")) + "x").status_code, 401)
+
+    @override_settings(REFRESH_TOKEN_MAX_AGE=-1)
+    def test_expired_refresh_token_rejected(self):
+        self.assertEqual(self.refresh(issue_refresh_token(_user("old", "buyer"))).status_code, 401)
 
 
 class RoleEnforcementTest(TestCase):

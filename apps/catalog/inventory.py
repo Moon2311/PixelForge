@@ -205,6 +205,7 @@ class InventoryManager:
         min_stock_alert: Optional[int] = None,
         note: str = "",
         actor_user_id: Optional[int] = None,
+        action: Optional[str] = None,
     ) -> dict:
         """Update stock for a product (adapter for legacy API).
 
@@ -221,6 +222,8 @@ class InventoryManager:
             min_stock_alert: Optional minimum stock alert threshold
             note: Optional note for the log
             actor_user_id: ID of the user performing the action
+            action: Log action for a delta change (e.g. ``sale``); defaults
+                to stock_in/stock_out by the sign of ``delta``
 
         Returns:
             Dict with updated product data for response
@@ -266,7 +269,7 @@ class InventoryManager:
                         f"Delta would result in negative stock: "
                         f"{inventory.stock_quantity} + {delta} = {new_stock}"
                     )
-                action = (
+                action = action or (
                     InventoryLog.ACTION_STOCK_IN
                     if delta > 0
                     else InventoryLog.ACTION_STOCK_OUT

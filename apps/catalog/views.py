@@ -8,11 +8,12 @@ from django.db.models import Avg, Q
 from django.utils import timezone
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
-from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAuthenticated
-from rest_framework.response import Response
 
 from apps.authentication.authentication import BearerTokenAuthentication
+from apps.common.custom_response import CustomResponse
+from apps.common.mixins import CustomResponseMixin
+from apps.common.pagination import CustomPagination
 from apps.catalog.serializers import (
     AttributeSerializer,
     AttributeListSerializer,
@@ -88,29 +89,8 @@ from apps.authentication.permissions import (
 # ---------------------------------------------------------------------------
 
 
-class StandardPagination(PageNumberPagination):
+class StandardPagination(CustomPagination):
     page_size = 20
-    page_size_query_param = "page_size"
-    max_page_size = 100
-
-
-# ---------------------------------------------------------------------------
-# Response helpers
-# ---------------------------------------------------------------------------
-
-
-def success_response(data=None, message="Success", status_code=status.HTTP_200_OK):
-    return Response(
-        {"message": message, "status": status_code, "data": data},
-        status=status_code,
-    )
-
-
-def error_response(message="Error", status_code=status.HTTP_400_BAD_REQUEST, data=None):
-    return Response(
-        {"message": message, "status": status_code, "data": data},
-        status=status_code,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +98,7 @@ def error_response(message="Error", status_code=status.HTTP_400_BAD_REQUEST, dat
 # ---------------------------------------------------------------------------
 
 
-class CategoryViewSet(viewsets.ModelViewSet):
+class CategoryViewSet(CustomResponseMixin, viewsets.ModelViewSet):
     """CRUD for categories."""
 
     queryset = Category.objects.filter(is_deleted=False)
@@ -154,7 +134,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         with transaction.atomic():
             instance.soft_delete()
-        return success_response(message="Category deleted successfully")
+        return CustomResponse.successful_response(message="Category deleted successfully")
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +142,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 
 
-class SubcategoryViewSet(viewsets.ModelViewSet):
+class SubcategoryViewSet(CustomResponseMixin, viewsets.ModelViewSet):
     """CRUD for subcategories."""
 
     queryset = Subcategory.objects.filter(is_deleted=False)
@@ -201,7 +181,7 @@ class SubcategoryViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         with transaction.atomic():
             instance.soft_delete()
-        return success_response(message="Subcategory deleted successfully")
+        return CustomResponse.successful_response(message="Subcategory deleted successfully")
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +189,7 @@ class SubcategoryViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 
 
-class BrandViewSet(viewsets.ModelViewSet):
+class BrandViewSet(CustomResponseMixin, viewsets.ModelViewSet):
     """CRUD for brands."""
 
     queryset = Brand.objects.filter(is_deleted=False)
@@ -250,7 +230,7 @@ class BrandViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         with transaction.atomic():
             instance.soft_delete()
-        return success_response(message="Brand deleted successfully")
+        return CustomResponse.successful_response(message="Brand deleted successfully")
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +238,7 @@ class BrandViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 
 
-class ProductViewSet(viewsets.ModelViewSet):
+class ProductViewSet(CustomResponseMixin, viewsets.ModelViewSet):
     """CRUD for products."""
 
     queryset = Product.objects.filter(is_deleted=False)
@@ -338,7 +318,7 @@ class ProductViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         with transaction.atomic():
             instance.soft_delete()
-        return success_response(message="Product archived successfully")
+        return CustomResponse.successful_response(message="Product archived successfully")
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +326,7 @@ class ProductViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 
 
-class ProductImageViewSet(viewsets.ModelViewSet):
+class ProductImageViewSet(CustomResponseMixin, viewsets.ModelViewSet):
     """CRUD for product images."""
 
     serializer_class = ProductImageSerializer
@@ -366,7 +346,7 @@ class ProductImageViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         with transaction.atomic():
             instance.delete()
-        return success_response(message="Image deleted successfully")
+        return CustomResponse.successful_response(message="Image deleted successfully")
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +354,7 @@ class ProductImageViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 
 
-class ProductVariantViewSet(viewsets.ModelViewSet):
+class ProductVariantViewSet(CustomResponseMixin, viewsets.ModelViewSet):
     """CRUD for product variants."""
 
     authentication_classes = [BearerTokenAuthentication]
@@ -414,7 +394,7 @@ class ProductVariantViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         with transaction.atomic():
             instance.soft_delete()
-        return success_response(message="Variant archived successfully")
+        return CustomResponse.successful_response(message="Variant archived successfully")
 
     @action(detail=False, methods=["get"], url_path="(?P<variant_pk>[^/.]+)")
     def retrieve_variant(self, request, product_pk=None, variant_pk=None):
@@ -424,10 +404,13 @@ class ProductVariantViewSet(viewsets.ModelViewSet):
                 pk=variant_pk, product_id=product_pk, is_deleted=False
             )
         except ProductVariant.DoesNotExist:
-            return error_response("Variant not found", status.HTTP_404_NOT_FOUND)
+            return CustomResponse.failed_response(
+                "Variant not found",
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         serializer = ProductVariantSerializer(variant)
-        return success_response(data=serializer.data)
+        return CustomResponse.successful_response(serializer.data)
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +418,7 @@ class ProductVariantViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 
 
-class AttributeViewSet(viewsets.ModelViewSet):
+class AttributeViewSet(CustomResponseMixin, viewsets.ModelViewSet):
     """CRUD for attributes."""
 
     queryset = Attribute.objects.all()
@@ -453,7 +436,7 @@ class AttributeViewSet(viewsets.ModelViewSet):
         return [IsAdminOrCatalogManager()]
 
 
-class ProductAttributeViewSet(viewsets.ModelViewSet):
+class ProductAttributeViewSet(CustomResponseMixin, viewsets.ModelViewSet):
     """Assign attributes to products."""
 
     serializer_class = ProductAttributeValueSerializer
@@ -485,7 +468,7 @@ class ProductAttributeViewSet(viewsets.ModelViewSet):
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
         instance.delete()
-        return success_response(message="Attribute removed from product")
+        return CustomResponse.successful_response(message="Attribute removed from product")
 
 
 # ---------------------------------------------------------------------------
@@ -493,7 +476,7 @@ class ProductAttributeViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 
 
-class ProductSpecificationViewSet(viewsets.ModelViewSet):
+class ProductSpecificationViewSet(CustomResponseMixin, viewsets.ModelViewSet):
     """CRUD for product specifications."""
 
     serializer_class = ProductSpecificationSerializer
@@ -518,7 +501,7 @@ class ProductSpecificationViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 
 
-class VariantPriceViewSet(viewsets.ModelViewSet):
+class VariantPriceViewSet(CustomResponseMixin, viewsets.ModelViewSet):
     """CRUD for variant pricing."""
 
     serializer_class = VariantPriceSerializer
@@ -552,7 +535,7 @@ class VariantPriceViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 
 
-class VariantInventoryViewSet(viewsets.GenericViewSet):
+class VariantInventoryViewSet(CustomResponseMixin, viewsets.GenericViewSet):
     """Inventory management for variants."""
 
     serializer_class = InventorySerializer
@@ -568,11 +551,14 @@ class VariantInventoryViewSet(viewsets.GenericViewSet):
         try:
             variant = ProductVariant.objects.get(pk=variant_pk, is_deleted=False)
         except ProductVariant.DoesNotExist:
-            return error_response("Variant not found", status.HTTP_404_NOT_FOUND)
+            return CustomResponse.failed_response(
+                "Variant not found",
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         inventory, _ = Inventory.objects.get_or_create(variant=variant)
         serializer = InventorySerializer(inventory)
-        return success_response(data=serializer.data)
+        return CustomResponse.successful_response(serializer.data)
 
     @action(detail=False, methods=["patch"])
     def adjust(self, request, product_pk=None, variant_pk=None):
@@ -580,7 +566,10 @@ class VariantInventoryViewSet(viewsets.GenericViewSet):
         try:
             variant = ProductVariant.objects.get(pk=variant_pk, is_deleted=False)
         except ProductVariant.DoesNotExist:
-            return error_response("Variant not found", status.HTTP_404_NOT_FOUND)
+            return CustomResponse.failed_response(
+                "Variant not found",
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         serializer = InventoryAdjustSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -633,13 +622,13 @@ class VariantInventoryViewSet(viewsets.GenericViewSet):
                 )
 
 
-        return success_response(
-            data=InventorySerializer(inventory).data,
-            message="Inventory adjusted successfully",
+        return CustomResponse.successful_response(
+            InventorySerializer(inventory).data,
+            "Inventory adjusted successfully",
         )
 
 
-class InventoryLogsViewSet(viewsets.ReadOnlyModelViewSet):
+class InventoryLogsViewSet(CustomResponseMixin, viewsets.ReadOnlyModelViewSet):
     """Read-only view for inventory logs."""
 
     serializer_class = InventoryLogSerializer
@@ -661,7 +650,7 @@ class InventoryLogsViewSet(viewsets.ReadOnlyModelViewSet):
         return qs.order_by("-created_at")
 
 
-class LowStockAlertViewSet(viewsets.ModelViewSet):
+class LowStockAlertViewSet(CustomResponseMixin, viewsets.ModelViewSet):
     """Low stock alerts management."""
 
     serializer_class = LowStockAlertSerializer
@@ -685,7 +674,7 @@ class LowStockAlertViewSet(viewsets.ModelViewSet):
         """PATCH /api/catalog/inventory/low-stock/{id}/resolve/"""
         alert = self.get_object()
         if alert.status == "resolved":
-            return error_response("Alert already resolved")
+            return CustomResponse.failed_response("Alert already resolved")
 
         user = getattr(request, "user", None)
         actor_id = getattr(user, "pk", None) if user else None
@@ -695,9 +684,9 @@ class LowStockAlertViewSet(viewsets.ModelViewSet):
         alert.resolved_by = actor_id
         alert.save()
 
-        return success_response(
-            data=LowStockAlertSerializer(alert).data,
-            message="Alert resolved successfully",
+        return CustomResponse.successful_response(
+            LowStockAlertSerializer(alert).data,
+            "Alert resolved successfully",
         )
 
 
@@ -706,7 +695,7 @@ class LowStockAlertViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 
 
-class ProductReviewViewSet(viewsets.ModelViewSet):
+class ProductReviewViewSet(CustomResponseMixin, viewsets.ModelViewSet):
     """CRUD for product reviews.
 
     Supports:
@@ -796,24 +785,24 @@ class ProductReviewViewSet(viewsets.ModelViewSet):
         review = self.get_object()
 
         if review.status == ProductReview.STATUS_APPROVED:
-            return error_response("Review is already approved")
+            return CustomResponse.failed_response("Review is already approved")
 
         # Prevent self-approval
         user = getattr(request, "user", None)
         user_id = getattr(user, "pk", None) if user else None
         if user_id and review.user_id == user_id:
-            return error_response(
+            return CustomResponse.failed_response(
                 "You cannot approve your own review",
-                status.HTTP_403_FORBIDDEN,
+                status=status.HTTP_403_FORBIDDEN,
             )
 
         with transaction.atomic():
             review.status = ProductReview.STATUS_APPROVED
             review.save(update_fields=["status", "updated_at"])
 
-        return success_response(
-            data=ProductReviewSerializer(review).data,
-            message="Review approved successfully",
+        return CustomResponse.successful_response(
+            ProductReviewSerializer(review).data,
+            "Review approved successfully",
         )
 
     @action(detail=True, methods=["post"], url_path="reject")
@@ -825,15 +814,15 @@ class ProductReviewViewSet(viewsets.ModelViewSet):
         review = self.get_object()
 
         if review.status == ProductReview.STATUS_REJECTED:
-            return error_response("Review is already rejected")
+            return CustomResponse.failed_response("Review is already rejected")
 
         with transaction.atomic():
             review.status = ProductReview.STATUS_REJECTED
             review.save(update_fields=["status", "updated_at"])
 
-        return success_response(
-            data=ProductReviewSerializer(review).data,
-            message="Review rejected successfully",
+        return CustomResponse.successful_response(
+            ProductReviewSerializer(review).data,
+            "Review rejected successfully",
         )
 
 
@@ -842,7 +831,7 @@ class ProductReviewViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 
 
-class CatalogSearchView(viewsets.ReadOnlyModelViewSet):
+class CatalogSearchView(CustomResponseMixin, viewsets.ReadOnlyModelViewSet):
     """Public search endpoint for the catalog."""
 
     serializer_class = ProductListSerializer

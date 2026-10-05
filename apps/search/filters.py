@@ -17,6 +17,7 @@ indexes rather than per-row joins:
 from decimal import Decimal
 
 from django.db.models import Case, Exists, F, IntegerField, OuterRef, Q, Value, When
+from django.db.models.functions import NullIf
 from django.utils import timezone
 
 from apps.catalog.models import (
@@ -188,6 +189,8 @@ FLAT_SORT_FIELDS = {
     "rating": "flat_rating",
     "created_at": "created_at",
     "updated_at": "updated_at",
+    # Share of the price taken off by the sale price.
+    "discount": (F("flat_price") - F("flat_discount_price")) / NullIf(F("flat_price"), 0),
 }
 
 FLAT_DEFAULT_SORT = [F("updated_at").desc(nulls_last=True), "-pk"]
@@ -241,6 +244,9 @@ def flat_admin_condition(params) -> Q:
     if _truthy(params.get("featured")):
         condition &= Q(is_featured=True)
 
+    if _truthy(params.get("on_sale")):
+        condition &= Q(flat_discount_price__isnull=False, flat_discount_price__lt=F("flat_price"))
+
     if _truthy(params.get("flash_sale")):
         condition &= Q(flash_sale=True, flash_sale_ends_at__gte=timezone.now())
 
@@ -255,5 +261,6 @@ def flat_admin_ordering(params) -> list:
     if field is None:
         return FLAT_DEFAULT_SORT
     desc = raw.startswith("-") or (params.get("order") or "asc").strip().lower() == "desc"
-    expression = F(field).desc(nulls_last=True) if desc else F(field).asc(nulls_last=True)
+    expression = F(field) if isinstance(field, str) else field
+    expression = expression.desc(nulls_last=True) if desc else expression.asc(nulls_last=True)
     return [expression, "-pk"]

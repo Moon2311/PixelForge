@@ -308,6 +308,28 @@ class LegacyProductApiTest(TestCase):
         meta = self.client.get("/api/products/meta/").json()["data"]
         self.assertEqual(meta, {"categories": ["Smartphones", "TV"], "brands": ["Samsung", "Sony"]})
 
+    def test_list_is_paginated(self):
+        for i in range(25):
+            self._create(name=f"Phone {i}", sku=f"P{i}")
+
+        data = self.client.get("/api/products/").json()["data"]
+        self.assertEqual((data["count"], len(data["results"]), data["total_pages"]), (25, 20, 2))
+        self.assertTrue(data["has_next"])
+
+        data = self.client.get("/api/products/", {"name": "phone", "page": 2, "page_size": 10}).json()["data"]
+        self.assertEqual((data["count"], len(data["results"]), data["page"]), (25, 10, 2))
+
+        data = self.client.get("/api/products/", {"search": "phone", "page_size": 500}).json()["data"]
+        self.assertEqual((len(data["results"]), data["page_size"]), (25, 100))
+
+    def test_deals_sorted_by_discount(self):
+        self._create(name="Small deal", sku="S", price=100.0, discount_price=90.0)
+        self._create(name="Big deal", sku="B", price=100.0, discount_price=50.0)
+        self._create(name="No deal", sku="N", price=100.0, discount_price=100.0)
+
+        resp = self.client.get("/api/products/", {"on_sale": 1, "sort": "discount", "order": "desc"})
+        self.assertEqual([p["name"] for p in resp.json()["data"]["results"]], ["Big deal", "Small deal"])
+
     def test_stock_endpoint_and_delete(self):
         product_id = self._create().json()["data"]["id"]
         resp = self.api.patch(f"/api/products/{product_id}/stock/", {"delta": 5}, format="json")

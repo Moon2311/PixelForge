@@ -115,19 +115,19 @@ class ResetPasswordTests(APITestCase):
         payload["new_password"] = payload["confirm_password"] = "An0ther-pass!"
         response = self.client.post(RESET_URL, payload)
         self.assertEqual(response.status_code, 400)
-        self.assertIn("token", response.data)
+        self.assertIn("token", response.data["data"])
 
     def test_invalid_token_or_uid_rejected(self):
         for overrides in [{"token": "bad-token"}, {"uid": "garbage"}, {"uid": "OTk5"}]:
             response = self.client.post(RESET_URL, reset_payload(self.buyer, **overrides))
             self.assertEqual(response.status_code, 400)
-            self.assertIn("token", response.data)
+            self.assertIn("token", response.data["data"])
 
     def test_non_buyer_rejected_with_generic_error(self):
         manager = make_user("manager", "manager@example.com", "inventory_manager")
         response = self.client.post(RESET_URL, reset_payload(manager))
         self.assertEqual(response.status_code, 400)
-        self.assertIn("token", response.data)
+        self.assertIn("token", response.data["data"])
 
     def test_weak_password_rejected(self):
         response = self.client.post(
@@ -135,11 +135,11 @@ class ResetPasswordTests(APITestCase):
             reset_payload(self.buyer, new_password="12345678", confirm_password="12345678"),
         )
         self.assertEqual(response.status_code, 400)
-        self.assertIn("new_password", response.data)
+        self.assertIn("new_password", response.data["data"])
 
     def test_mismatched_passwords_rejected(self):
         response = self.client.post(
             RESET_URL, reset_payload(self.buyer, confirm_password="Different-pass-1!")
         )
         self.assertEqual(response.status_code, 400)
-        self.assertIn("confirm_password", response.data)
+        self.assertIn("confirm_password", response.data["data"])

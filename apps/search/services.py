@@ -205,20 +205,52 @@ class BrandSearch:
 # GET /api/products/ (flat storefront search and admin list)
 # ---------------------------------------------------------------------------
 
-DEFAULT_LIMIT = 1000
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 100
 
 
 def _split_csv(value):
     return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 
-def storefront_search(name="", brand="", specification="", limit=DEFAULT_LIMIT):
+def _positive_int(value, default):
+    value = str(value or "").strip()
+    return int(value) if value.isdigit() and int(value) > 0 else default
+
+
+def page_params(params):
+    """``(page, page_size)`` from ``page`` and ``page_size`` (or ``limit``)."""
+    page = _positive_int(params.get("page"), 1)
+    page_size = _positive_int(params.get("page_size") or params.get("limit"), DEFAULT_PAGE_SIZE)
+    return page, min(page_size, MAX_PAGE_SIZE)
+
+
+def _paginate(queryset, page, page_size):
+    """Fetch one page of ``queryset`` from the database (LIMIT/OFFSET).
+
+    Returns ``(total, results, pagination)``.
+    """
+    total = queryset.count()
+    offset = (page - 1) * page_size
+    results = [product_store.serialize(p) for p in queryset[offset:offset + page_size]]
+    total_pages = (total + page_size - 1) // page_size
+    return total, results, {
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_previous": page > 1,
+    }
+
+
+def storefront_search(name="", brand="", specification="", page=1, page_size=DEFAULT_PAGE_SIZE):
     """Storefront search: a product matches if ANY term matches.
 
     Every comma-separated term from ``name``, ``brand`` and ``specification``
     is matched (case-insensitive substring) against the product's name, SKU,
     descriptions, specifications, color, size, tags, brand, category and
     subcategory. Products whose name contains a ``name`` term come first.
+    Returns ``(total, results, pagination)`` for one page.
     """
     name_terms = _split_csv(name)
     terms = list(dict.fromkeys(name_terms + _split_csv(brand) + _split_csv(specification)))
@@ -236,47 +268,17 @@ def storefront_search(name="", brand="", specification="", limit=DEFAULT_LIMIT):
         ).order_by("-name_hit", *search_filters.FLAT_DEFAULT_SORT)
     else:
         queryset = queryset.order_by(*search_filters.FLAT_DEFAULT_SORT)
-    return [product_store.serialize(p) for p in queryset[:limit]]
+    return _paginate(queryset, page, page_size)
 
 
 def admin_product_list(params):
-    """Admin list: filtered, sorted and optionally paginated.
+    """Admin list: filtered, sorted and paginated.
 
-    Returns ``(total, results, pagination_or_None)``.
+    Returns ``(total, results, pagination)``.
     """
     queryset = (
         product_store.products_queryset()
         .filter(search_filters.flat_admin_condition(params))
         .order_by(*search_filters.flat_admin_ordering(params))
     )
-
-    page_param = (params.get("page") or "").strip()
-    if page_param.isdigit() and int(page_param) > 0:
-        page = int(page_param)
-        page_size = max(1, min(int((params.get("page_size") or "10").strip() or 10), 100))
-    else:
-        page, page_size = None, None
-
-    limit = (params.get("limit") or "").strip()
-    if page_size:
-        size = page_size
-    elif limit.isdigit() and int(limit) > 0:
-        size = int(limit)
-    else:
-        size = DEFAULT_LIMIT
-
-    total = queryset.count()
-    offset = (page - 1) * page_size if page else 0
-    results = [product_store.serialize(p) for p in queryset[offset:offset + size]]
-
-    if page is None:
-        return total, results, None
-
-    total_pages = (total + page_size - 1) // page_size if total else 0
-    return total, results, {
-        "page": page,
-        "page_size": page_size,
-        "total_pages": total_pages,
-        "has_next": page < total_pages,
-        "has_previous": page > 1,
-    }
+    return _paginate(queryset, *page_params(params))

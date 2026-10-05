@@ -15,6 +15,8 @@ urlpatterns = [
     path("api/catalog/", include("apps.catalog.urls")),
     path("api/search/", include("apps.search.urls")),
     path("api/cart/", include("apps.cart.urls")),
+    path("api/orders/", include("apps.orders.urls")),
+    path("api/payments/", include("apps.payments.urls")),
     # Flat product/category/brand/banner endpoints used by the storefront
     path("api/", include("apps.catalog.legacy_urls")),
 ]

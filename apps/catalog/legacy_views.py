@@ -6,11 +6,11 @@ from django.conf import settings
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.db.models import F, Q
-from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework import status
 
 from apps.authentication.authentication import BearerTokenAuthentication
+from apps.common.custom_response import CustomResponse
 from apps.catalog.inventory import InventoryManager, InventoryError, InsufficientStockError, VariantNotFoundError
 from apps.catalog.legacy_inventory_serializers import LegacyInventoryLogSerializer, LegacyLowStockAlertSerializer
 from apps.catalog.models import Product, RecentlyViewed
@@ -25,8 +25,6 @@ from apps.catalog.legacy_serializers import (
 
 ALLOWED_IMAGE_EXT = {"jpg", "jpeg", "png", "webp"}
 ADMIN_LIST_PARAMS = {
-    "page",
-    "page_size",
     "search",
     "category",
     "stock_status",
@@ -35,20 +33,10 @@ ADMIN_LIST_PARAMS = {
     "status",
     "sort",
     "order",
-    "limit",
     "featured",
+    "on_sale",
     "flash_sale",
 }
-
-
-class APIResponse:
-    @staticmethod
-    def success(data=None, message="Success", status_code=status.HTTP_200_OK):
-        return Response({"message": message, "status": status_code, "data": data}, status=status_code)
-
-    @staticmethod
-    def error(message="Error", status_code=status.HTTP_400_BAD_REQUEST, data=None):
-        return Response({"message": message, "status": status_code, "data": data}, status=status_code)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +114,7 @@ class ListProductsView(APIView):
 
     Admin list mode (paginated, filtered, sorted) is activated by any
     admin-only parameter. Otherwise GET behaves as the public product search.
+    Both are paginated in the database with ``page`` and ``page_size``.
     POST creates a product and requires an authenticated admin.
     """
 
@@ -144,24 +133,29 @@ class ListProductsView(APIView):
             params = request.query_params
             if any(key in params for key in ADMIN_LIST_PARAMS):
                 total, results, pagination = search_services.admin_product_list(params)
-                data = {"count": total, "results": results, **(pagination or {})}
-                return APIResponse.success(data=data)
-
-            products = search_services.storefront_search(
-                name=params.get("name") or params.get("q") or "",
-                brand=params.get("brand") or "",
-                specification=params.get("specification") or "",
-            )
-            return APIResponse.success(data={"count": len(products), "results": products})
+            else:
+                page, page_size = search_services.page_params(params)
+                total, results, pagination = search_services.storefront_search(
+                    name=params.get("name") or params.get("q") or "",
+                    brand=params.get("brand") or "",
+                    specification=params.get("specification") or "",
+                    page=page,
+                    page_size=page_size,
+                )
+            return CustomResponse.successful_response({"count": total, "results": results, **pagination})
         except Exception as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     def post(self, request):
         serializer = ProductSerializer(data=request.data)
         if not serializer.is_valid():
-            return APIResponse.error(
-                message="Validation failed", status_code=status.HTTP_400_BAD_REQUEST,
+            return CustomResponse.failed_response(
+                "Validation failed",
                 data=serializer.errors,
+                status=status.HTTP_400_BAD_REQUEST,
             )
         data = serializer.validated_data
 
@@ -171,23 +165,28 @@ class ListProductsView(APIView):
         try:
             images = collect_images(request)
         except ValueError as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_400_BAD_REQUEST)
+            return CustomResponse.failed_response(str(e), status=status.HTTP_400_BAD_REQUEST)
 
         try:
             doc, _ = product_store.save_product(data, images, actor_user_id=_actor_id(request))
         except Exception as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
-        return APIResponse.success(
-            data=doc, message="Product created successfully", status_code=status.HTTP_201_CREATED
+        return CustomResponse.successful_response(
+            doc,
+            "Product created successfully",
+            status=status.HTTP_201_CREATED,
         )
 
 
 def _sku_taken():
-    return APIResponse.error(
-        message="A product with this SKU already exists",
-        status_code=status.HTTP_400_BAD_REQUEST,
+    return CustomResponse.failed_response(
+        "A product with this SKU already exists",
         data={"sku": "A product with this SKU already exists"},
+        status=status.HTTP_400_BAD_REQUEST,
     )
 
 
@@ -196,9 +195,12 @@ class ProductMetaView(APIView):
 
     def get(self, request):
         try:
-            return APIResponse.success(data=product_store.get_filter_options())
+            return CustomResponse.successful_response(product_store.get_filter_options())
         except Exception as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class AdminProductWriteViewMixin:
@@ -226,17 +228,21 @@ class ProductDetailView(APIView):
         try:
             product = product_store.get_product(product_id)
         except product_store.ProductDoesNotExist as exc:
-            return APIResponse.error(message=str(exc), status_code=status.HTTP_404_NOT_FOUND)
+            return CustomResponse.failed_response(str(exc), status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        return APIResponse.success(data=product)
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return CustomResponse.successful_response(product)
 
     def _update(self, request, product_id):
         serializer = ProductSerializer(data=request.data)
         if not serializer.is_valid():
-            return APIResponse.error(
-                message="Validation failed", status_code=status.HTTP_400_BAD_REQUEST,
+            return CustomResponse.failed_response(
+                "Validation failed",
                 data=serializer.errors,
+                status=status.HTTP_400_BAD_REQUEST,
             )
         data = serializer.validated_data
 
@@ -246,18 +252,21 @@ class ProductDetailView(APIView):
         try:
             images = collect_images(request)
         except ValueError as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_400_BAD_REQUEST)
+            return CustomResponse.failed_response(str(e), status=status.HTTP_400_BAD_REQUEST)
 
         try:
             doc, _ = product_store.save_product(
                 data, images, product_id=product_id, actor_user_id=_actor_id(request)
             )
         except product_store.ProductDoesNotExist as exc:
-            return APIResponse.error(message=str(exc), status_code=status.HTTP_404_NOT_FOUND)
+            return CustomResponse.failed_response(str(exc), status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
-        return APIResponse.success(data=doc, message="Product updated successfully")
+        return CustomResponse.successful_response(doc, "Product updated successfully")
 
     def put(self, request, product_id):
         return self._update(request, product_id)
@@ -269,10 +278,13 @@ class ProductDetailView(APIView):
         try:
             product_store.delete_product(product_id, actor_user_id=_actor_id(request))
         except product_store.ProductDoesNotExist as exc:
-            return APIResponse.error(message=str(exc), status_code=status.HTTP_404_NOT_FOUND)
+            return CustomResponse.failed_response(str(exc), status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        return APIResponse.success(message="Product deleted successfully")
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return CustomResponse.successful_response(message="Product deleted successfully")
 
 
 class StockUpdateView(AdminProductWriteViewMixin, APIView):
@@ -281,9 +293,10 @@ class StockUpdateView(AdminProductWriteViewMixin, APIView):
     def patch(self, request, product_id):
         serializer = StockUpdateSerializer(data=request.data)
         if not serializer.is_valid():
-            return APIResponse.error(
-                message="Validation failed", status_code=status.HTTP_400_BAD_REQUEST,
+            return CustomResponse.failed_response(
+                "Validation failed",
                 data=serializer.errors,
+                status=status.HTTP_400_BAD_REQUEST,
             )
         data = serializer.validated_data
 
@@ -300,23 +313,18 @@ class StockUpdateView(AdminProductWriteViewMixin, APIView):
                 actor_user_id=actor_id,
             )
         except InsufficientStockError as e:
-            return APIResponse.error(
-                message=str(e), status_code=status.HTTP_400_BAD_REQUEST
-            )
+            return CustomResponse.failed_response(str(e), status=status.HTTP_400_BAD_REQUEST)
         except VariantNotFoundError as e:
-            return APIResponse.error(
-                message=str(e), status_code=status.HTTP_404_NOT_FOUND
-            )
+            return CustomResponse.failed_response(str(e), status=status.HTTP_404_NOT_FOUND)
         except InventoryError as e:
-            return APIResponse.error(
-                message=str(e), status_code=status.HTTP_400_BAD_REQUEST
-            )
+            return CustomResponse.failed_response(str(e), status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            return APIResponse.error(
-                message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        return APIResponse.success(data=result, message="Stock updated successfully")
+        return CustomResponse.successful_response(result, "Stock updated successfully")
 
 
 class StockHistoryView(AdminProductWriteViewMixin, APIView):
@@ -324,8 +332,8 @@ class StockHistoryView(AdminProductWriteViewMixin, APIView):
 
     def get(self, request, product_id):
         logs = InventoryManager.get_inventory_logs(product_id=product_id)
-        return APIResponse.success(
-            data=LegacyInventoryLogSerializer(logs, many=True).data
+        return CustomResponse.successful_response(
+            LegacyInventoryLogSerializer(logs, many=True).data,
         )
 
 
@@ -344,8 +352,8 @@ class InventoryLogsView(AdminProductWriteViewMixin, APIView):
             product_id=product_id,
             action=action,
         )
-        return APIResponse.success(
-            data=LegacyInventoryLogSerializer(logs, many=True).data
+        return CustomResponse.successful_response(
+            LegacyInventoryLogSerializer(logs, many=True).data,
         )
 
 
@@ -355,8 +363,8 @@ class LowStockAlertsView(AdminProductWriteViewMixin, APIView):
     def get(self, request):
         active_only = (request.query_params.get("all") or "").strip().lower() not in ("1", "true", "yes")
         alerts = InventoryManager.get_low_stock_alerts(active_only=active_only)
-        return APIResponse.success(
-            data=LegacyLowStockAlertSerializer(alerts, many=True).data
+        return CustomResponse.successful_response(
+            LegacyLowStockAlertSerializer(alerts, many=True).data,
         )
 
 
@@ -373,12 +381,11 @@ class LowStockAlertResolveView(AdminProductWriteViewMixin, APIView):
                 resolved_by=actor_id,
             )
         except InventoryError as e:
-            return APIResponse.error(
-                message=str(e), status_code=status.HTTP_404_NOT_FOUND
-            )
+            return CustomResponse.failed_response(str(e), status=status.HTTP_404_NOT_FOUND)
 
-        return APIResponse.success(
-            data=LegacyLowStockAlertSerializer(alert).data, message="Alert resolved"
+        return CustomResponse.successful_response(
+            LegacyLowStockAlertSerializer(alert).data,
+            "Alert resolved",
         )
 
 
@@ -398,9 +405,10 @@ def _collect_single_image(request, field):
 def _catalog_data(request):
     serializer = CatalogSerializer(data=request.data)
     if not serializer.is_valid():
-        return None, APIResponse.error(
-            message="Validation failed", status_code=status.HTTP_400_BAD_REQUEST,
+        return None, CustomResponse.failed_response(
+            "Validation failed",
             data=serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST,
         )
     data = serializer.validated_data
     data["image"] = _collect_single_image(request, "image")
@@ -425,8 +433,11 @@ class CatalogWriteViewMixin(APIView):
         try:
             items = self._list(request)
         except Exception as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        return APIResponse.success(data={"count": len(items), "results": items})
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return CustomResponse.successful_response({"count": len(items), "results": items})
 
     def post(self, request):
         data, error = _catalog_data(request)
@@ -435,10 +446,17 @@ class CatalogWriteViewMixin(APIView):
         try:
             doc = catalog_store.create_document(self.kind, data)
         except catalog_store.CatalogConflict as exc:
-            return APIResponse.error(message=str(exc), status_code=status.HTTP_400_BAD_REQUEST)
+            return CustomResponse.failed_response(str(exc), status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        return APIResponse.success(data=doc, message="Created successfully", status_code=status.HTTP_201_CREATED)
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return CustomResponse.successful_response(
+            doc,
+            "Created successfully",
+            status=status.HTTP_201_CREATED,
+        )
 
     def _list(self, request):
         raise NotImplementedError
@@ -461,10 +479,13 @@ class CatalogDetailViewMixin(APIView):
         try:
             doc = catalog_store.get_document(self.kind, doc_id)
         except catalog_store.CatalogDoesNotExist as exc:
-            return APIResponse.error(message=str(exc), status_code=status.HTTP_404_NOT_FOUND)
+            return CustomResponse.failed_response(str(exc), status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        return APIResponse.success(data=doc)
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return CustomResponse.successful_response(doc)
 
     def put(self, request, doc_id):
         data, error = _catalog_data(request)
@@ -473,21 +494,27 @@ class CatalogDetailViewMixin(APIView):
         try:
             doc = catalog_store.update_document(self.kind, doc_id, data)
         except catalog_store.CatalogDoesNotExist as exc:
-            return APIResponse.error(message=str(exc), status_code=status.HTTP_404_NOT_FOUND)
+            return CustomResponse.failed_response(str(exc), status=status.HTTP_404_NOT_FOUND)
         except catalog_store.CatalogConflict as exc:
-            return APIResponse.error(message=str(exc), status_code=status.HTTP_400_BAD_REQUEST)
+            return CustomResponse.failed_response(str(exc), status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        return APIResponse.success(data=doc, message="Updated successfully")
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return CustomResponse.successful_response(doc, "Updated successfully")
 
     def delete(self, request, doc_id):
         try:
             catalog_store.delete_document(self.kind, doc_id)
         except catalog_store.CatalogDoesNotExist as exc:
-            return APIResponse.error(message=str(exc), status_code=status.HTTP_404_NOT_FOUND)
+            return CustomResponse.failed_response(str(exc), status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        return APIResponse.success(message="Deleted successfully")
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return CustomResponse.successful_response(message="Deleted successfully")
 
 
 class CategoriesView(CatalogWriteViewMixin):
@@ -524,9 +551,9 @@ class BannersView(CatalogWriteViewMixin):
     def get(self, request):
         banner_type = (request.query_params.get("type") or "").strip()
         if banner_type and banner_type not in catalog_store.BANNER_TYPES:
-            return APIResponse.error(
-                message="type must be one of: hero, promotion",
-                status_code=status.HTTP_400_BAD_REQUEST,
+            return CustomResponse.failed_response(
+                "type must be one of: hero, promotion",
+                status=status.HTTP_400_BAD_REQUEST,
             )
         return super().get(request)
 
@@ -574,9 +601,12 @@ class RecommendedProductsView(APIView):
                 "-pk",
             )
             products = [product_store.serialize(p) for p in queryset[:8]]
-            return APIResponse.success(data={"count": len(products), "results": products})
+            return CustomResponse.successful_response({"count": len(products), "results": products})
         except Exception as e:
-            return APIResponse.error(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return CustomResponse.failed_response(
+                str(e),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class RecentlyViewedView(APIView):
@@ -606,12 +636,15 @@ class RecentlyViewedView(APIView):
             product_ids = product_ids[:20]
 
         products = product_store.get_products(product_ids)
-        return APIResponse.success(data={"count": len(products), "results": products})
+        return CustomResponse.successful_response({"count": len(products), "results": products})
 
     def post(self, request):
         user = getattr(request, "user", None)
         if user is None or not getattr(user, "is_authenticated", False):
-            return APIResponse.success(data={"saved": False}, message="Guest history is stored client-side")
+            return CustomResponse.successful_response(
+                {"saved": False},
+                "Guest history is stored client-side",
+            )
 
         raw = (request.data.get("ids") or request.data.get("product_ids") or "").strip()
         product_ids = [int(p) for p in raw.split(",") if p.strip().isdigit()][:20]
@@ -628,11 +661,11 @@ class RecentlyViewedView(APIView):
                     "thumbnail": product.get("thumbnail", ""),
                 },
             )
-        return APIResponse.success(data={"saved": len(product_ids)})
+        return CustomResponse.successful_response({"saved": len(product_ids)})
 
     def delete(self, request):
         user = getattr(request, "user", None)
         if user is not None and getattr(user, "is_authenticated", False):
             RecentlyViewed.objects.filter(user_id=user.pk).delete()
-            return APIResponse.success(message="History cleared")
-        return APIResponse.success(message="Nothing to clear for guests")
+            return CustomResponse.successful_response(message="History cleared")
+        return CustomResponse.successful_response(message="Nothing to clear for guests")
