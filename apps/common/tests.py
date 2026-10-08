@@ -4,12 +4,13 @@ from apps.common.custom_response import CustomResponse
 
 
 class HealthCheckTest(TestCase):
-    def test_reports_django_and_database(self):
+    def test_reports_django_database_and_redis(self):
         resp = self.client.get("/api/health/")
         self.assertEqual(resp.status_code, 200)
         body = resp.json()["data"]
         self.assertEqual(body["status"], "healthy")
-        self.assertEqual(set(body["checks"]), {"django", "database"})
+        self.assertEqual(set(body["checks"]), {"django", "database", "redis"})
+        self.assertEqual(body["checks"]["redis"]["status"], "disabled")  # test runner turns the cache off
 
 
 class ApiRootTest(TestCase):

@@ -12,6 +12,7 @@ from django.db.models.functions import Coalesce
 from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 
+from apps.catalog.cache import invalidate_all_products
 from apps.catalog.models import Inventory, Product, ProductReview, ProductVariant, VariantPrice
 
 
@@ -37,7 +38,10 @@ def _review_stat(aggregate):
 def refresh_product_stats(product_ids=None):
     """Recompute stats for the given products (all products when None)."""
     queryset = Product.objects.all()
-    if product_ids is not None:
+    if product_ids is None:
+        # queryset.update() sends no signals; drop every cached product document.
+        invalidate_all_products()
+    else:
         product_ids = [pk for pk in set(product_ids) if pk is not None]
         if not product_ids:
             return 0

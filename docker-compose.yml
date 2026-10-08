@@ -1,5 +1,7 @@
 # Development environment: `docker compose up --build`
-# Backend (all modules) on http://localhost:8000, PostgreSQL on localhost:5433.
+# Backend (all modules) on http://localhost:8000.
+# PostgreSQL primary on localhost:5433, read replica (streaming replication) on localhost:5434.
+# Redis (cache only) is reachable from the backend container, not from the host.
 services:
   backend:
     build: .
@@ -9,15 +11,26 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgres://pixelforge:pixelforge@postgres:5432/pixelforge
+      DB_PRIMARY_HOST: postgres
+      DB_PRIMARY_NAME: pixelforge
+      DB_PRIMARY_USER: pixelforge
+      DB_PRIMARY_PASSWORD: pixelforge
+      # Name/user/password default to the primary's (they replicate).
+      DB_REPLICA_HOST: postgres-replica
       SECRET_KEY: ${SECRET_KEY:-django-insecure-docker-dev-only}
       DEBUG: "True"
       PASSWORD_RESET_URL: ${PASSWORD_RESET_URL:-http://localhost:5173/reset-password}
+      REDIS_URL: redis://redis:6379/1
     volumes:
       - .:/app
     depends_on:
       postgres:
         condition: service_healthy
+      # The backend works without Redis or the replica (it reads the primary), so only start them first.
+      postgres-replica:
+        condition: service_started
+      redis:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/')"]
       interval: 10s
@@ -27,19 +40,60 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    # Primary. wal_level=replica and max_wal_senders=10 are PostgreSQL 16's
+    # defaults; wal_keep_size keeps enough WAL for a replica that restarts.
+    command: ["postgres", "-c", "wal_level=replica", "-c", "max_wal_senders=10", "-c", "wal_keep_size=256MB"]
     environment:
       POSTGRES_DB: pixelforge
       POSTGRES_USER: pixelforge
       POSTGRES_PASSWORD: pixelforge
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-replicator-dev-only}
     ports:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Replication role + pg_hba rule; runs on a new volume (see the script for existing ones).
+      - ./docker/postgres/primary-replication.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U pixelforge -d pixelforge"]
       interval: 5s
       timeout: 5s
       retries: 10
 
+  postgres-replica:
+    image: postgres:16-alpine
+    # Hot standby: clones the primary on first start, then streams its WAL (async).
+    user: postgres
+    entrypoint: ["sh", "/replica-entrypoint.sh"]
+    environment:
+      PRIMARY_HOST: postgres
+      REPLICATION_USER: replicator
+      PGPASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-replicator-dev-only}
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./docker/postgres/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pixelforge -d pixelforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # A cache, not a database: no persistence, bounded memory, evict the least recently used keys.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   postgres_data:
+  postgres_replica_data:

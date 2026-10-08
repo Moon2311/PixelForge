@@ -1,0 +1,181 @@
+# High-availability development cluster (opt-in):
+#
+#   docker compose -f docker-compose.ha.yml up -d --build
+#
+#   etcd1..3     consensus store (leader key, cluster state); quorum = 2 of 3
+#   pg1..pg4     PostgreSQL 16 + Patroni: one is elected primary, the others
+#                stream from it. No node is "the" primary: any can be promoted.
+#   haproxy      stable endpoints: writer :5000 (current primary), reader
+#                :5001 (healthy replicas), Patroni API :8008, stats :8404
+#   reconciler   keeps 1 primary + DESIRED_REPLICAS healthy replicas
+#   backend      Django, using only the writer and reader endpoints
+#   redis        cache + read-your-writes markers
+#
+# Separate project name and volumes: the plain docker-compose.yml stack and
+# its data are not touched. Development only (no TLS, dev passwords, the
+# reconciler drives Docker through its socket). See README "High availability".
+name: pixelforge-ha
+
+x-etcd: &etcd
+  image: quay.io/coreos/etcd:v3.5.17
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "etcdctl", "endpoint", "health"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+x-patroni: &patroni
+  build: ./docker/patroni
+  image: pixelforge-patroni:16
+  restart: unless-stopped
+  labels:
+    com.pixelforge.ha.node: "true"
+  environment: &patroni-env
+    PATRONI_SCOPE: pixelforge
+    PATRONI_ETCD3_HOSTS: etcd1:2379,etcd2:2379,etcd3:2379
+    PATRONI_SUPERUSER_USERNAME: postgres
+    PATRONI_SUPERUSER_PASSWORD: ${HA_SUPERUSER_PASSWORD:-superuser-dev-only}
+    PATRONI_REPLICATION_USERNAME: replicator
+    PATRONI_REPLICATION_PASSWORD: ${HA_REPLICATION_PASSWORD:-replicator-dev-only}
+    PATRONI_REWIND_USERNAME: rewinder
+    PATRONI_REWIND_PASSWORD: ${HA_REWIND_PASSWORD:-rewinder-dev-only}
+    APP_DB_NAME: pixelforge
+    APP_DB_USER: pixelforge
+    APP_DB_PASSWORD: ${HA_APP_DB_PASSWORD:-pixelforge}
+  depends_on:
+    etcd1: {condition: service_healthy}
+    etcd2: {condition: service_healthy}
+    etcd3: {condition: service_healthy}
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "http://localhost:8008/liveness"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+
+services:
+  etcd1:
+    <<: *etcd
+    command:
+      - etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd1:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd1:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=pixelforge-ha
+    volumes: [etcd1_data:/etcd-data]
+  etcd2:
+    <<: *etcd
+    command:
+      - etcd
+      - --name=etcd2
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd2:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd2:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=pixelforge-ha
+    volumes: [etcd2_data:/etcd-data]
+  etcd3:
+    <<: *etcd
+    command:
+      - etcd
+      - --name=etcd3
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd3:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd3:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=pixelforge-ha
+    volumes: [etcd3_data:/etcd-data]
+
+  pg1:
+    <<: *patroni
+    hostname: pg1
+    networks: {default: {aliases: [pgnode]}}
+    volumes: [pg1_data:/var/lib/postgresql/data]
+  pg2:
+    <<: *patroni
+    hostname: pg2
+    networks: {default: {aliases: [pgnode]}}
+    volumes: [pg2_data:/var/lib/postgresql/data]
+  pg3:
+    <<: *patroni
+    hostname: pg3
+    networks: {default: {aliases: [pgnode]}}
+    volumes: [pg3_data:/var/lib/postgresql/data]
+  pg4:
+    <<: *patroni
+    hostname: pg4
+    networks: {default: {aliases: [pgnode]}}
+    volumes: [pg4_data:/var/lib/postgresql/data]
+
+  haproxy:
+    image: haproxy:3.2-alpine
+    restart: unless-stopped
+    volumes:
+      - ./docker/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "127.0.0.1:${HA_WRITER_PORT:-5000}:5000"
+      - "127.0.0.1:${HA_READER_PORT:-5001}:5001"
+      - "127.0.0.1:${HA_STATS_PORT:-8404}:8404"
+      - "127.0.0.1:${HA_PATRONI_API_PORT:-8008}:8008"
+
+  reconciler:
+    build: ./docker/ha-reconciler
+    restart: unless-stopped
+    environment:
+      PATRONI_API: http://haproxy:8008
+      DESIRED_REPLICAS: ${DESIRED_REPLICAS:-3}
+      FAILOVER_ENABLED: ${FAILOVER_ENABLED:-true}
+      RECONCILE_INTERVAL: 5
+      SCALE_DOWN_SURPLUS: "true"
+    volumes:
+      # Development only: lets the reconciler start/remove node containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on: [haproxy, pg1, pg2, pg3, pg4]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+
+  backend:
+    build: .
+    # The writer may still be electing on first start: retry migrations.
+    command: >
+      sh -c "until python manage.py migrate --noinput; do echo 'waiting for the writer'; sleep 3; done &&
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 60"
+    ports:
+      - "127.0.0.1:${HA_BACKEND_PORT:-8001}:8000"
+    environment:
+      SECRET_KEY: ${SECRET_KEY:-django-insecure-docker-dev-only}
+      DEBUG: "True"
+      # Only logical endpoints: Django never knows which node is primary.
+      DB_PRIMARY_HOST: haproxy
+      DB_PRIMARY_NAME: pixelforge
+      DB_PRIMARY_USER: pixelforge
+      DB_PRIMARY_PASSWORD: ${HA_APP_DB_PASSWORD:-pixelforge}
+      DB_WRITER_ENDPOINT: haproxy:5000
+      DB_READER_ENDPOINT: haproxy:5001
+      FAILOVER_ENABLED: ${FAILOVER_ENABLED:-true}
+      DB_HA_STATUS_URL: http://haproxy:8008
+      DB_DESIRED_REPLICA_COUNT: ${DESIRED_REPLICAS:-3}
+      REDIS_URL: redis://redis:6379/1
+    depends_on: [haproxy, redis]
+
+volumes:
+  etcd1_data:
+  etcd2_data:
+  etcd3_data:
+  pg1_data:
+  pg2_data:
+  pg3_data:
+  pg4_data:

@@ -7,4 +7,4 @@ class CatalogConfig(AppConfig):
     verbose_name = "Catalog"
 
     def ready(self):
-        from apps.catalog import stats  # noqa: F401  (connects signal handlers)
+        from apps.catalog import cache, stats  # noqa: F401  (connects signal handlers)

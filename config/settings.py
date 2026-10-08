@@ -8,6 +8,7 @@ from pathlib import Path
 
 import environ
 from corsheaders.defaults import default_headers
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -50,6 +51,8 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    # Read routing (primary/replica); before sessions/auth so their writes are seen.
+    "apps.common.db.middleware.ReadReplicaMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -79,20 +82,186 @@ WSGI_APPLICATION = "config.wsgi.application"
 
 
 # ---------------------------------------------------------------------------
-# Database — one PostgreSQL database for every module
+# Database — a writer (the PostgreSQL primary: every write) and optional
+# readers (hot-standby replicas). See README "Read replica" and "High
+# availability". Never log these settings (they hold passwords).
+#
+#   writer:  DB_WRITER_ENDPOINT (host:port of a stable endpoint that always
+#            reaches the current primary, e.g. HAProxy in front of Patroni),
+#            else DB_PRIMARY_HOST/..., else DATABASE_URL.
+#   readers, first match wins:
+#     READ_REPLICA_COUNT=N   N replicas DB_REPLICA_<i>_HOST/... (or
+#                            DATABASE_REPLICA_<i>_URL); Django spreads reads
+#                            over the healthy ones (aliases replica_1..N).
+#     DB_READER_ENDPOINT     one load-balanced reader endpoint (alias replica).
+#     DB_REPLICA_HOST/...    one replica (alias replica), as before.
+#     DATABASE_REPLICA_URL
+# Unset name/user/password parts default to the writer's.
 # ---------------------------------------------------------------------------
 
-DATABASES = {
-    "default": env.db(
-        "DATABASE_URL",
-        default="postgres://postgres:postgres@localhost:5432/pixelforge",
-    ),
-}
-DATABASES["default"].update({
+
+def _database(prefix, url_var, url_default="", defaults=None):
+    """DB_<prefix>_HOST/PORT/NAME/USER/PASSWORD when DB_<prefix>_HOST is set,
+    else the URL in ``url_var``, else None. Unset parts come from ``defaults``."""
+    defaults = defaults or {}
+    host = env.str(f"DB_{prefix}_HOST", default="")
+    if host:
+        return {
+            "ENGINE": "django.db.backends.postgresql",
+            "HOST": host,
+            "PORT": env.str(f"DB_{prefix}_PORT", default=str(defaults.get("PORT") or 5432)),
+            "NAME": env.str(f"DB_{prefix}_NAME", default=defaults.get("NAME", "pixelforge")),
+            "USER": env.str(f"DB_{prefix}_USER", default=defaults.get("USER", "postgres")),
+            "PASSWORD": env.str(f"DB_{prefix}_PASSWORD", default=defaults.get("PASSWORD", "")),
+        }
+    url = env.str(url_var, default=url_default)
+    return environ.Env.db_url_config(url) if url else None
+
+
+def _endpoint(name):
+    """DB_<name>_ENDPOINT ("host" or "host:port") as {"HOST", "PORT"}, or None."""
+    value = env.str(f"DB_{name}_ENDPOINT", default="").strip()
+    if not value:
+        return None
+    host, sep, port = value.rpartition(":")
+    if not sep:
+        host, port = value, "5432"
+    return {"HOST": host, "PORT": port}
+
+
+_primary = _database("PRIMARY", "DATABASE_URL", "postgres://postgres:postgres@localhost:5432/pixelforge")
+_primary.update(_endpoint("WRITER") or {})
+
+READ_REPLICA_COUNT = env.int("READ_REPLICA_COUNT", default=0)
+_replicas = {}
+if READ_REPLICA_COUNT > 0:
+    for _i in range(1, READ_REPLICA_COUNT + 1):
+        _config = _database(f"REPLICA_{_i}", f"DATABASE_REPLICA_{_i}_URL", defaults=_primary)
+        if _config is None:
+            raise ImproperlyConfigured(
+                f"READ_REPLICA_COUNT={READ_REPLICA_COUNT} but neither DB_REPLICA_{_i}_HOST "
+                f"nor DATABASE_REPLICA_{_i}_URL is set"
+            )
+        _replicas[f"replica_{_i}"] = _config
+elif _endpoint("READER"):
+    _replicas["replica"] = {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": env.str("DB_REPLICA_NAME", default=_primary.get("NAME", "pixelforge")),
+        "USER": env.str("DB_REPLICA_USER", default=_primary.get("USER", "postgres")),
+        "PASSWORD": env.str("DB_REPLICA_PASSWORD", default=_primary.get("PASSWORD", "")),
+        **_endpoint("READER"),
+    }
+elif _legacy_replica := _database("REPLICA", "DATABASE_REPLICA_URL", defaults=_primary):
+    _replicas["replica"] = _legacy_replica
+
+_connection = {
     "CONN_MAX_AGE": env.int("DATABASE_CONN_MAX_AGE", default=600),
     "CONN_HEALTH_CHECKS": True,
-    "OPTIONS": {"connect_timeout": 10},
-})
+}
+
+# Seconds to wait for a replica connection before reading from the primary.
+REPLICA_CONNECT_TIMEOUT = env.int("REPLICA_CONNECT_TIMEOUT", default=2)
+
+DATABASES = {
+    # The writer: every write, every migration, and every read that needs it.
+    "default": {
+        **_primary,
+        **_connection,
+        "OPTIONS": {**_primary.get("OPTIONS", {}), "connect_timeout": 10},
+    },
+}
+for _alias, _config in _replicas.items():
+    DATABASES[_alias] = {
+        **_config,
+        **_connection,
+        "OPTIONS": {
+            **_config.get("OPTIONS", {}),
+            "connect_timeout": REPLICA_CONNECT_TIMEOUT,
+            # A hot standby is read-only anyway; this also protects a
+            # replica alias that is (mis)configured to point at a primary.
+            "options": "-c default_transaction_read_only=on",
+        },
+        # Tests use the primary's test database through this alias.
+        "TEST": {"MIRROR": "default"},
+    }
+# The reader pool: aliases replica-eligible reads may use.
+READ_REPLICA_ALIASES = list(_replicas)
+
+# True when the writer endpoint is an HA cluster with automatic failover
+# (Patroni + etcd + HAProxy in docker-compose.ha.yml, or a managed service).
+# Django never promotes anything; this only adds the cluster's view to
+# /api/health/database/ (from DB_HA_STATUS_URL, a Patroni REST endpoint).
+FAILOVER_ENABLED = env.bool("FAILOVER_ENABLED", default=False)
+DB_HA_STATUS_URL = env.str("DB_HA_STATUS_URL", default="")
+# Replicas the infrastructure keeps running (reported by health checks).
+DB_DESIRED_REPLICA_COUNT = env.int("DB_DESIRED_REPLICA_COUNT", default=READ_REPLICA_COUNT or len(_replicas))
+
+DATABASE_ROUTERS = ["apps.common.db.router.PrimaryReplicaRouter"]
+
+# False keeps every read on the primary even when a replica is configured.
+READ_REPLICA_ENABLED = env.bool("READ_REPLICA_ENABLED", default=True)
+# Apps whose models may be read from the replica (catalog: products,
+# categories, brands, banners, reviews; also everything search reads).
+READ_REPLICA_APPS = env.list("READ_REPLICA_APPS", default=["catalog"])
+# How long (seconds) a caller's last write is remembered in Redis. Reads
+# use the replica again only once it has replayed that write (LSN check);
+# the TTL is not proof that it has. Must exceed REPLICA_MAX_LAG +
+# REPLICA_HEALTH_INTERVAL (checked by common.W002).
+RECENT_WRITE_TTL = env.int("RECENT_WRITE_TTL", default=30)
+# Seconds the replica may be behind before all reads go to the primary.
+REPLICA_MAX_LAG = env.float("REPLICA_MAX_LAG", default=10.0)
+# Seconds between replica health/lag checks (per worker).
+REPLICA_HEALTH_INTERVAL = env.float("REPLICA_HEALTH_INTERVAL", default=5.0)
+# Seconds a worker reads only from the primary after a replica error.
+REPLICA_FAILURE_COOLDOWN = env.int("REPLICA_FAILURE_COOLDOWN", default=30)
+
+
+# ---------------------------------------------------------------------------
+# Cache — Redis, shared by every Gunicorn worker. PostgreSQL stays the source
+# of truth: the cache only holds copies of read data and may be lost at any
+# time. See README "Caching".
+# ---------------------------------------------------------------------------
+
+# Docker Compose sets redis://redis:6379/1; never log this URL (it may hold a password).
+REDIS_URL = env.str("REDIS_URL", default="redis://127.0.0.1:6379/1")
+# Short timeouts: a slow or unreachable Redis must not slow requests down.
+REDIS_SOCKET_TIMEOUT = env.float("REDIS_SOCKET_TIMEOUT", default=0.25)
+
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": REDIS_URL,
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            "SOCKET_CONNECT_TIMEOUT": REDIS_SOCKET_TIMEOUT,
+            "SOCKET_TIMEOUT": REDIS_SOCKET_TIMEOUT,
+            # Django/DRF internals (e.g. throttling) carry on without Redis.
+            # Not logged per call (a traceback per request during an outage):
+            # apps.common.cache logs outages once per cooldown and
+            # /api/health/ reports them.
+            "IGNORE_EXCEPTIONS": True,
+        },
+    }
+}
+
+# apps.common.cache (cache-aside with stampede, penetration and avalanche protection)
+CACHE_ENABLED = env.bool("CACHE_ENABLED", default=True)
+CACHE_KEY_PREFIX = env.str("CACHE_KEY_PREFIX", default="pixelforge")
+# TTLs in seconds; each entry lives base TTL + random(0, jitter).
+CACHE_DEFAULT_TTL = env.int("CACHE_DEFAULT_TTL", default=300)
+CACHE_TTL_JITTER = env.int("CACHE_TTL_JITTER", default=30)
+# "Does not exist" markers (cache penetration).
+NEGATIVE_CACHE_TTL = env.int("NEGATIVE_CACHE_TTL", default=60)
+NEGATIVE_CACHE_TTL_JITTER = env.int("NEGATIVE_CACHE_TTL_JITTER", default=15)
+# Rebuild mutex (cache stampede). The lock outlives the slowest rebuild;
+# waiters poll with backoff (retry delay doubling up to the max delay) and
+# load from PostgreSQL themselves after the wait timeout.
+CACHE_LOCK_TTL = env.float("CACHE_LOCK_TTL", default=5.0)
+CACHE_LOCK_WAIT_TIMEOUT = env.float("CACHE_LOCK_WAIT_TIMEOUT", default=2.0)
+CACHE_LOCK_RETRY_DELAY = env.float("CACHE_LOCK_RETRY_DELAY", default=0.05)
+CACHE_LOCK_RETRY_MAX_DELAY = env.float("CACHE_LOCK_RETRY_MAX_DELAY", default=0.2)
+# After a Redis error, each worker skips Redis for this many seconds.
+CACHE_FAILURE_COOLDOWN = env.int("CACHE_FAILURE_COOLDOWN", default=30)
 
 
 # ---------------------------------------------------------------------------
@@ -259,5 +428,14 @@ LOGGING = {
         "catalog": {"handlers": ["console"], "level": "INFO", "propagate": False},
         "cart": {"handlers": ["console"], "level": "INFO", "propagate": False},
         "apps": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        # DEBUG also logs every cache hit/miss/set.
+        "apps.cache": {
+            "handlers": ["console"],
+            "level": env.str("CACHE_LOG_LEVEL", default="INFO"),
+            "propagate": False,
+        },
     },
 }
+
+# The test suite runs without Redis; cache tests opt in (apps/common/test_runner.py).
+TEST_RUNNER = "apps.common.test_runner.TestRunner"

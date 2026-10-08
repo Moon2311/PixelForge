@@ -38,13 +38,20 @@ def issue_access_token(user):
     return _signer().sign(str(user.pk))
 
 
-def user_from_access_token(token):
-    """Return the active User for a valid, unexpired token, else None."""
+def user_id_from_access_token(token):
+    """The user id in a valid, unexpired token, else None. No database
+    query: the user may since have been deactivated (see user_from_access_token)."""
     try:
         user_id = _signer().unsign(token, max_age=settings.ACCESS_TOKEN_MAX_AGE)
     except (BadSignature, SignatureExpired):
         return None
-    return _active_user(user_id)
+    return int(user_id) if user_id.isdigit() else None
+
+
+def user_from_access_token(token):
+    """Return the active User for a valid, unexpired token, else None."""
+    user_id = user_id_from_access_token(token)
+    return None if user_id is None else _active_user(str(user_id))
 
 
 def _password_fingerprint(user):
