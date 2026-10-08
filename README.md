@@ -3,7 +3,9 @@
 Backend for PixelForge: a **modular monolith**. One Django project and one
 process serve every module (authentication, catalog, search, cart) from
 **one PostgreSQL database**. PostgreSQL handles both the transactional data
-and all search, filtering, sorting and faceting.
+and all search, filtering, sorting and faceting. **Redis** is an optional
+shared cache in front of hot catalog reads; PostgreSQL stays the source of
+truth (see [Caching](#caching-redis)).
 
 ```
                  React frontend
@@ -18,12 +20,13 @@ Authentication   Catalog  ◄──── Search          Cart
      │              └─ in-process calls (no HTTP) ┘
      └──────────────┴──────┬───────┴──────────────┘
                            ▼
-                      PostgreSQL
-            (transactions + search/filtering)
+      Redis (cache) ◄── catalog reads ──► PostgreSQL
+      copies only,                (source of truth: transactions
+      may be lost                  + search/filtering)
 ```
 
-There is no Elasticsearch, message broker, Redis/Celery or internal HTTP
-between modules.
+There is no Elasticsearch, message broker, Celery or internal HTTP between
+modules.
 
 ## Quick start
 
@@ -33,7 +36,8 @@ between modules.
 docker compose up --build
 ```
 
-The backend is at `http://localhost:8000` and runs migrations on start. PostgreSQL is published on host port `5433`.
+The backend is at `http://localhost:8000` and runs migrations on start. PostgreSQL is published on host port `5433`;
+Redis runs inside the Compose network only.
 Seed demo data with:
 
 ```bash
@@ -43,6 +47,8 @@ docker compose exec backend python manage.py seed_catalog
 ```
 
 **Local (without Docker)** uses [uv](https://docs.astral.sh/uv/) and requires PostgreSQL on `localhost:5432`.
+Redis on `localhost:6379` is optional (`sudo apt install redis-server`, `brew install redis`, or
+`docker run -d -p 127.0.0.1:6379:6379 redis:7-alpine`); without it every read goes to PostgreSQL.
 
 ```bash
 uv sync                               # creates .venv from pyproject.toml + uv.lock
@@ -54,6 +60,8 @@ uv run manage.py runserver            # http://localhost:8000
 ```
 
 **Tests:** `uv run manage.py test` (needs a PostgreSQL user that can create the test database and the `pg_trgm` extension).
+The suite runs with the cache off; the cache tests use Redis at `REDIS_TEST_URL` (default `redis://127.0.0.1:6379/15`)
+and are skipped when it isn't reachable.
 
 **Dependencies** live in `pyproject.toml` and are pinned in `uv.lock`: `uv add <package>` to add one, `uv lock --upgrade` to refresh.
 
@@ -70,6 +78,8 @@ PixelForge/
 │   └── merge_legacy_databases.sh   # one-off copy from the old per-service databases
 └── apps/
     ├── common/             # health check, uniform APIResponse, test_db_connection
+    │   └── cache/          # Redis cache service: manager (cache-aside, negative cache, TTL jitter),
+    │                       # locks (rebuild mutex), keys, client (failure handling), metrics
     ├── authentication/     # Role/UserProfile, register/login/logout/password reset,
     │                       # Bearer token auth (tokens.py, authentication.py), RBAC permissions
     ├── catalog/            # catalog models, /api/catalog/ viewsets, flat /api/products|
@@ -77,6 +87,7 @@ PixelForge/
     │   ├── selectors.py    # public read API used by other modules (e.g. cart)
     │   ├── product_store.py / catalog_store.py   # flat endpoint documents <-> models
     │   ├── inventory.py    # transaction-safe stock changes, logs, low-stock alerts
+    │   ├── cache.py        # cached product/category/brand reads + invalidation signals
     │   └── stats.py        # denormalized price/stock/rating columns (kept in sync)
     ├── search/             # PostgreSQL search
     │   ├── filters.py      # keyword/filter/order builders (Q expressions)
@@ -110,7 +121,7 @@ changed: everything is now served on `:8000`.
 | `/api/products/`, `/api/categories/`, `/api/brands/`, `/api/banners/` | catalog (+search) | flat storefront/admin endpoints used by the React app |
 | `/api/cart/` | cart | user cart (`Bearer`), guest cart (`X-Guest-Session`), merge |
 | `/api/orders/` | orders | checkout options, place order from the cart, order detail |
-| `/api/health/` | common | Django + PostgreSQL |
+| `/api/health/` | common | Django + PostgreSQL + Redis |
 | `/admin/` | Django admin | |
 
 Responses keep their existing envelopes. The auth and cart modules return
@@ -247,6 +258,218 @@ with the trigram/BitmapOr plan. A full `/api/search/products/?q=…` page with
 facets takes about 100 ms, and a price-filtered search with no keyword about
 150 ms.
 
+## Caching (Redis)
+
+Redis is a **shared cache** for read-heavy, public catalog data. Every
+Gunicorn worker uses the same Redis, so an entry built by one worker serves
+all of them. **PostgreSQL remains the source of truth:** Redis only holds
+copies, can be emptied at any time, and nothing ever writes data to Redis
+that isn't in PostgreSQL first.
+
+```
+Browser → Nginx → Django ──► Redis           HIT  → response
+                       │
+                       └──► PostgreSQL       MISS → store in Redis → response
+```
+
+Application code uses `apps.common.cache`, never Redis directly. It runs on
+django-redis's connection for `CACHES["default"]`, so there is one Redis
+configuration.
+
+### What is cached
+
+| Data | Endpoint | Key | TTL |
+|------|----------|-----|-----|
+| Product document | `GET /api/products/<id>/` | `pixelforge:product:<id>` | 300 s + 0–30 s jitter |
+| Unknown product id | `GET /api/products/<id>/` → 404 | `pixelforge:product:<id>` (not-found marker) | 60 s + 0–15 s jitter |
+| Active categories | `GET /api/categories/` | `pixelforge:catalog:categories` | 600 s + 0–60 s jitter |
+| Active brands | `GET /api/brands/` | `pixelforge:catalog:brands` | 600 s + 0–60 s jitter |
+
+Rebuild locks are `pixelforge:lock:<key>`, e.g. `pixelforge:lock:product:42`.
+
+**Never cached:** cart, orders, checkout validation, inventory locking,
+payments and their callbacks, auth tokens, roles and permissions, and
+personalized endpoints (recommended, recently viewed). Checkout reads
+products and stock from PostgreSQL inside its transaction
+(`catalog.selectors`, `catalog.inventory`), so a stale cached `stock_quantity`
+can only affect what a page displays, never what gets sold.
+
+### Cache-aside with a rebuild mutex (stampede protection)
+
+When a hot key expires, hundreds of requests can miss at the same moment
+and all query PostgreSQL (a *cache stampede*). Only the request holding the
+key's mutex rebuilds it:
+
+```
+                    Request
+                       │
+                       ▼
+                     Redis
+                       │
+              ┌────────┴────────┐
+              │                 │
+             HIT               MISS
+              │                 │
+              ▼                 ▼
+            Return       SET lock NX PX
+                                │
+                         ┌──────┴──────┐
+                         │             │
+                      acquired      held by another request
+                         │             │
+                         ▼             ▼
+                 check Redis again   wait 50 → 100 → 200 ms
+                  (hit? return)        │  then read Redis
+                         │             │  (hit? return; else retry the lock)
+                         ▼             │
+                   PostgreSQL          │  after CACHE_LOCK_WAIT_TIMEOUT:
+                         │             │  load from PostgreSQL itself
+                         ▼             │
+                   store in Redis ◄────┘
+                         │
+                 release lock (only if
+                 it still holds our token)
+                         │
+                         ▼
+                       Return
+```
+
+* The lock is `SET pixelforge:lock:<key> <random token> NX PX <CACHE_LOCK_TTL>`:
+  atomic, one holder, and it always expires, so a crashed worker can't
+  deadlock a key.
+* Release runs a Lua script that deletes the lock only if it still holds the
+  caller's token. A request whose lock already expired can't delete the
+  next holder's lock. Release happens in `finally`, also when the loader fails.
+* The holder **re-checks Redis after acquiring the lock**: a previous holder
+  may have just stored the value.
+* Waiters back off (50 → 100 → 200 ms, ±20% jitter, so they don't poll in
+  lockstep) and never wait longer than `CACHE_LOCK_WAIT_TIMEOUT`.
+
+Measured on the dev server: 50 concurrent requests for a cold product ran
+**one** rebuild; the other 49 were served from Redis.
+
+### Negative caching (penetration protection)
+
+Requests for ids that don't exist (`/api/products/999999/`, bots, scrapers)
+would always miss and always reach PostgreSQL. A genuine "does not exist"
+result is stored as an explicit marker with a short TTL
+(`NEGATIVE_CACHE_TTL`), and the 404 is answered from Redis until it expires.
+
+Values are stored as JSON envelopes, so a miss, a cached `null` and a cached
+"not found" can't be confused:
+
+```
+pixelforge:product:42      {"v": {"id": 42, "name": "...", ...}}
+pixelforge:product:999999  {"nf": "Product 999999 not found"}
+```
+
+Only the "does not exist" exception is cached. Database errors and timeouts
+propagate and are never cached. Creating the product deletes its marker.
+
+### TTL jitter (avalanche protection)
+
+Entries written together (after a deploy, a Redis restart, or a busy minute)
+would expire together and send all that traffic to PostgreSQL at once. Every
+TTL is `base + random(0, jitter)` seconds (always ≥ 1), so expiries spread out.
+Each kind of data has its own base TTL and jitter (`CachePolicy`), see the
+table above.
+
+### Invalidation
+
+Signal handlers in `apps/catalog/cache.py` delete affected keys **after the
+transaction commits** (`transaction.on_commit`). A rolled-back change
+invalidates nothing, and no reader can re-cache data that is about to be
+rolled back.
+
+| Change | Deleted |
+|--------|---------|
+| Product saved / soft-deleted | `product:<id>`, `catalog:categories`, `catalog:brands` (product counts) |
+| Variant, price, inventory (incl. every order), image, review | `product:<id>` |
+| Category or brand saved | its list key + `product:<id>` of each of its products |
+| `refresh_product_stats` full rebuild (`queryset.update()` sends no signals) | every `product:*` key (SCAN, maintenance only) |
+
+TTLs only bound staleness when an invalidation is lost, e.g. Redis was
+unreachable at that moment.
+
+### When Redis is unavailable
+
+```
+Redis error ─► log one WARNING ─► skip Redis in this worker for CACHE_FAILURE_COOLDOWN ─► PostgreSQL ─► response
+```
+
+Requests never fail because of Redis. Connect and socket timeouts are
+`REDIS_SOCKET_TIMEOUT` (0.25 s), and after an error each worker skips Redis
+for 30 s, so an outage costs one timeout and one log line per worker per
+cooldown instead of one per request. Once Redis answers again, caching
+resumes and an INFO line is logged. DRF throttling (password reset) also
+uses this cache; django-redis's `IGNORE_EXCEPTIONS` lets it carry on
+without Redis.
+
+`/api/health/` reports Redis separately: PostgreSQL down is `unhealthy`
+(503), Redis down is only `degraded` (200). `CACHE_ENABLED=True` with a
+`CACHES` backend other than django-redis fails `manage.py check` (`common.E001`).
+
+### Observability
+
+Logger `apps.cache` (set `CACHE_LOG_LEVEL=DEBUG` to see every hit, miss and
+set). Per-worker counters are in `/api/health/` under
+`checks.redis.cache_metrics`: `cache_hits_total`, `cache_misses_total`,
+`cache_negative_hits_total`, `cache_sets_total`, `cache_deletes_total`,
+`cache_lock_acquired_total`, `cache_lock_contention_total`,
+`cache_lock_timeout_total`, `cache_rebuild_total`, `cache_errors_total`.
+Logs never include Redis URLs, credentials or user data.
+
+### Cache configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `REDIS_URL` | `redis://127.0.0.1:6379/1` (Compose: `redis://redis:6379/1`) | Redis connection; may contain a password, never logged |
+| `REDIS_SOCKET_TIMEOUT` | `0.25` | Connect and command timeout (seconds) |
+| `CACHE_ENABLED` | `True` | `False` sends every read to PostgreSQL |
+| `CACHE_KEY_PREFIX` | `pixelforge` | Namespace of every key |
+| `CACHE_DEFAULT_TTL` / `CACHE_TTL_JITTER` | `300` / `30` | Default TTL + max random extra (seconds) |
+| `NEGATIVE_CACHE_TTL` / `NEGATIVE_CACHE_TTL_JITTER` | `60` / `15` | "Not found" marker TTL + jitter |
+| `CACHE_LOCK_TTL` | `5.0` | Rebuild-lock lifetime; longer than the slowest rebuild |
+| `CACHE_LOCK_WAIT_TIMEOUT` | `2.0` | Max wait for another request's rebuild |
+| `CACHE_LOCK_RETRY_DELAY` / `CACHE_LOCK_RETRY_MAX_DELAY` | `0.05` / `0.2` | Waiter backoff: first delay, doubling up to the max |
+| `CACHE_FAILURE_COOLDOWN` | `30` | Seconds a worker skips Redis after an error |
+| `CACHE_LOG_LEVEL` | `INFO` | `DEBUG` logs every hit/miss/set |
+
+### Caching another read
+
+Wrap the existing store/service function; don't cache in views or cache
+model instances:
+
+```python
+from apps.common import cache
+
+def get_category(category_id):
+    return cache.get_or_set(
+        cache.build_key("category", category_id),
+        lambda: catalog_store.get_document(catalog_store.CATEGORY, category_id),
+        policy=cache.CachePolicy(ttl=600, jitter=60),
+        not_found=catalog_store.CatalogDoesNotExist,
+    )
+```
+
+Then add invalidation for every write that changes the result, and a test
+that the second request runs no queries. Per-user data must pass
+`user_id=` to `build_key`. Free-text parts (search queries) are hashed
+automatically.
+
+### Testing
+
+```bash
+uv run manage.py test                                  # everything (cache tests need Redis)
+uv run manage.py test apps.common.tests_cache          # cache service: hit/miss, TTL, jitter,
+                                                       # negative cache, locks, 100-thread stampede,
+                                                       # Redis down
+uv run manage.py test apps.catalog.tests.test_cache    # endpoints, invalidation, checkout vs cache
+REDIS_TEST_URL=redis://127.0.0.1:6379/15 uv run manage.py test apps.common.tests_cache
+```
+
+Cache tests only touch keys under `pixelforge-test:`.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -264,6 +487,7 @@ facets takes about 100 ms, and a price-filtered search with no keyword about
 | `PASSWORD_RESET_THROTTLE_RATE` | `5/hour` | Forgot/reset rate limit |
 | `EMAIL_*`, `DEFAULT_FROM_EMAIL` | console backend | Outgoing email |
 | `PAYMENT_*`, `JAZZCASH_*`, `EASYPAISA_*` | empty | Online payments; see below |
+| `REDIS_URL`, `CACHE_*`, `NEGATIVE_CACHE_*` | see [Cache configuration](#cache-configuration) | Redis cache |
 
 ## Online payments (JazzCash and Easypaisa)
 

@@ -2,11 +2,17 @@ from django.db import connection
 from rest_framework import status
 from rest_framework.views import APIView
 
+from apps.common.cache import client as cache_client, metrics as cache_metrics
 from apps.common.custom_response import CustomResponse
 
 
 class HealthCheckView(APIView):
-    """GET /api/health/ — application and PostgreSQL health."""
+    """GET /api/health/ — application, PostgreSQL and Redis health.
+
+    PostgreSQL down is "unhealthy" (503). Redis down is only "degraded"
+    (200): it is a cache, and every request still works without it.
+    ``cache_metrics`` are counters of the worker that answered.
+    """
 
     authentication_classes = []
     permission_classes = []
@@ -21,11 +27,16 @@ class HealthCheckView(APIView):
             health["status"] = "unhealthy"
             health["checks"]["database"] = {"status": "error", "message": str(e)}
 
-        if health["status"] != "healthy":
+        redis_status = cache_client.ping()
+        health["checks"]["redis"] = {"status": redis_status, "cache_metrics": cache_metrics.snapshot()}
+        if redis_status == "error" and health["status"] == "healthy":
+            health["status"] = "degraded"
+
+        if health["status"] == "unhealthy":
             return CustomResponse.failed_response(
                 "Service unhealthy", data=health, status=status.HTTP_503_SERVICE_UNAVAILABLE
             )
-        return CustomResponse.successful_response(health, "Service healthy")
+        return CustomResponse.successful_response(health, f"Service {health['status']}")
 
 
 class ApiRootView(APIView):

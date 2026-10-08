@@ -12,6 +12,7 @@ dependencies = [
     "psycopg2-binary==2.9.11",
     "gunicorn==23.0.0",
     "cryptography==50.0.2",
+    "django-redis==7.0.0",
 ]
 
 [tool.uv]

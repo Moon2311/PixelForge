@@ -15,7 +15,7 @@ from apps.catalog.inventory import InventoryManager, InventoryError, Insufficien
 from apps.catalog.legacy_inventory_serializers import LegacyInventoryLogSerializer, LegacyLowStockAlertSerializer
 from apps.catalog.models import Product, RecentlyViewed
 from apps.authentication.permissions import IsAdmin
-from apps.catalog import catalog_store, product_store
+from apps.catalog import cache as catalog_cache, catalog_store, product_store
 from apps.search import services as search_services
 from apps.catalog.legacy_serializers import (
     CatalogSerializer,
@@ -226,7 +226,7 @@ class ProductDetailView(APIView):
 
     def get(self, request, product_id):
         try:
-            product = product_store.get_product(product_id)
+            product = catalog_cache.get_product(product_id)
         except product_store.ProductDoesNotExist as exc:
             return CustomResponse.failed_response(str(exc), status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
@@ -523,7 +523,7 @@ class CategoriesView(CatalogWriteViewMixin):
     kind = catalog_store.CATEGORY
 
     def _list(self, request):
-        return catalog_store.list_categories(active_only=True)
+        return catalog_cache.list_categories()
 
 
 class CategoryDetailView(CatalogDetailViewMixin):
@@ -536,7 +536,7 @@ class BrandsView(CatalogWriteViewMixin):
     kind = catalog_store.BRAND
 
     def _list(self, request):
-        return catalog_store.list_brands(active_only=True)
+        return catalog_cache.list_brands()
 
 
 class BrandDetailView(CatalogDetailViewMixin):

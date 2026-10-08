@@ -1,5 +1,6 @@
 # Development environment: `docker compose up --build`
 # Backend (all modules) on http://localhost:8000, PostgreSQL on localhost:5433.
+# Redis (cache only) is reachable from the backend container, not from the host.
 services:
   backend:
     build: .
@@ -13,11 +14,15 @@ services:
       SECRET_KEY: ${SECRET_KEY:-django-insecure-docker-dev-only}
       DEBUG: "True"
       PASSWORD_RESET_URL: ${PASSWORD_RESET_URL:-http://localhost:5173/reset-password}
+      REDIS_URL: redis://redis:6379/1
     volumes:
       - .:/app
     depends_on:
       postgres:
         condition: service_healthy
+      # The backend works without Redis (it serves from PostgreSQL), so only start it first.
+      redis:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/')"]
       interval: 10s
@@ -39,6 +44,16 @@ services:
       test: ["CMD-SHELL", "pg_isready -U pixelforge -d pixelforge"]
       interval: 5s
       timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # A cache, not a database: no persistence, bounded memory, evict the least recently used keys.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
       retries: 10
 
 volumes:

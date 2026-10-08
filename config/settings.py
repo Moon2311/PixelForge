@@ -96,6 +96,54 @@ DATABASES["default"].update({
 
 
 # ---------------------------------------------------------------------------
+# Cache — Redis, shared by every Gunicorn worker. PostgreSQL stays the source
+# of truth: the cache only holds copies of read data and may be lost at any
+# time. See README "Caching".
+# ---------------------------------------------------------------------------
+
+# Docker Compose sets redis://redis:6379/1; never log this URL (it may hold a password).
+REDIS_URL = env.str("REDIS_URL", default="redis://127.0.0.1:6379/1")
+# Short timeouts: a slow or unreachable Redis must not slow requests down.
+REDIS_SOCKET_TIMEOUT = env.float("REDIS_SOCKET_TIMEOUT", default=0.25)
+
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": REDIS_URL,
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            "SOCKET_CONNECT_TIMEOUT": REDIS_SOCKET_TIMEOUT,
+            "SOCKET_TIMEOUT": REDIS_SOCKET_TIMEOUT,
+            # Django/DRF internals (e.g. throttling) carry on without Redis.
+            # Not logged per call (a traceback per request during an outage):
+            # apps.common.cache logs outages once per cooldown and
+            # /api/health/ reports them.
+            "IGNORE_EXCEPTIONS": True,
+        },
+    }
+}
+
+# apps.common.cache (cache-aside with stampede, penetration and avalanche protection)
+CACHE_ENABLED = env.bool("CACHE_ENABLED", default=True)
+CACHE_KEY_PREFIX = env.str("CACHE_KEY_PREFIX", default="pixelforge")
+# TTLs in seconds; each entry lives base TTL + random(0, jitter).
+CACHE_DEFAULT_TTL = env.int("CACHE_DEFAULT_TTL", default=300)
+CACHE_TTL_JITTER = env.int("CACHE_TTL_JITTER", default=30)
+# "Does not exist" markers (cache penetration).
+NEGATIVE_CACHE_TTL = env.int("NEGATIVE_CACHE_TTL", default=60)
+NEGATIVE_CACHE_TTL_JITTER = env.int("NEGATIVE_CACHE_TTL_JITTER", default=15)
+# Rebuild mutex (cache stampede). The lock outlives the slowest rebuild;
+# waiters poll with backoff (retry delay doubling up to the max delay) and
+# load from PostgreSQL themselves after the wait timeout.
+CACHE_LOCK_TTL = env.float("CACHE_LOCK_TTL", default=5.0)
+CACHE_LOCK_WAIT_TIMEOUT = env.float("CACHE_LOCK_WAIT_TIMEOUT", default=2.0)
+CACHE_LOCK_RETRY_DELAY = env.float("CACHE_LOCK_RETRY_DELAY", default=0.05)
+CACHE_LOCK_RETRY_MAX_DELAY = env.float("CACHE_LOCK_RETRY_MAX_DELAY", default=0.2)
+# After a Redis error, each worker skips Redis for this many seconds.
+CACHE_FAILURE_COOLDOWN = env.int("CACHE_FAILURE_COOLDOWN", default=30)
+
+
+# ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 
@@ -259,5 +307,14 @@ LOGGING = {
         "catalog": {"handlers": ["console"], "level": "INFO", "propagate": False},
         "cart": {"handlers": ["console"], "level": "INFO", "propagate": False},
         "apps": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        # DEBUG also logs every cache hit/miss/set.
+        "apps.cache": {
+            "handlers": ["console"],
+            "level": env.str("CACHE_LOG_LEVEL", default="INFO"),
+            "propagate": False,
+        },
     },
 }
+
+# The test suite runs without Redis; cache tests opt in (apps/common/test_runner.py).
+TEST_RUNNER = "apps.common.test_runner.TestRunner"
