@@ -1,0 +1,70 @@
+# Patroni configuration shared by every node of the local HA cluster.
+# Per-node values (name, connect addresses) and every secret come from
+# PATRONI_* environment variables (see entrypoint.sh, docker-compose.ha.yml).
+scope: pixelforge
+namespace: /pixelforge/
+
+restapi:
+  listen: 0.0.0.0:8008
+
+# Leader election and cluster state live in etcd (3 members: a quorum of 2
+# survives one etcd failure). Only the holder of the leader key may run as
+# primary; it must renew the key every loop_wait or demote itself.
+etcd3:
+  hosts: etcd1:2379,etcd2:2379,etcd3:2379
+
+bootstrap:
+  # Dynamic cluster-wide settings, stored in etcd on first bootstrap.
+  dcs:
+    ttl: 20                 # leader key lifetime: a dead primary is replaced after at most ~20 s
+    loop_wait: 5
+    retry_timeout: 5        # loop_wait + 2 * retry_timeout <= ttl
+    # Never promote a replica more than 1 MB of WAL behind the last known primary position.
+    maximum_lag_on_failover: 1048576
+    check_timeline: true
+    postgresql:
+      use_pg_rewind: true   # an old primary rewinds onto the new timeline when it returns
+      use_slots: true       # the primary keeps WAL each member still needs
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        wal_log_hints: "on"
+        max_connections: 100
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_keep_size: 128MB
+        hot_standby_feedback: "on"
+        password_encryption: scram-sha-256
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+  post_bootstrap: /usr/local/bin/pixelforge-post-bootstrap.sh
+
+postgresql:
+  listen: 0.0.0.0:5432
+  data_dir: /var/lib/postgresql/data/pgdata
+  bin_dir: /usr/lib/postgresql/16/bin
+  pgpass: /tmp/pgpass
+  # If pg_rewind can't reconcile a returning node's diverged WAL, wipe it
+  # and re-clone from the current primary instead of starting it stale.
+  remove_data_directory_on_rewind_failure: true
+  remove_data_directory_on_diverged_timelines: true
+  create_replica_methods:
+    - basebackup
+  basebackup:
+    checkpoint: fast
+  pg_hba:
+    - local all all trust                         # inside the container only
+    - host replication replicator all scram-sha-256
+    - host all all all scram-sha-256
+  parameters:
+    unix_socket_directories: /var/run/postgresql
+
+watchdog:
+  mode: off                 # no /dev/watchdog in containers (see README: fencing)
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

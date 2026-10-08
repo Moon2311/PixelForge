@@ -8,3 +8,4 @@ class CommonConfig(AppConfig):
 
     def ready(self):
         from apps.common import checks  # noqa: F401  (registers system checks)
+        from apps.common.db import cluster, router  # noqa: F401  (connection signal handlers)

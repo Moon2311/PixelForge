@@ -13,6 +13,12 @@ commits (signal handlers below), so readers never re-cache data that is about
 to be rolled back. TTLs only bound staleness if an invalidation is lost
 (e.g. Redis was unreachable at that moment).
 
+With a read replica, refills read the replica only once it has replayed the
+last committed catalog change, and are stored only if no catalog change
+committed while they were loading (the catalog fence in
+apps.common.db.consistency, raised before the keys are deleted). A lagging
+replica therefore can't put old data back into Redis after an invalidation.
+
 Checkout never reads from here: orders and cart validate products and stock
 in PostgreSQL (``catalog.selectors``, ``catalog.inventory``).
 """
@@ -23,6 +29,7 @@ from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 
 from apps.common import cache
+from apps.common.db import consistency, context as db_context, replica
 from apps.catalog import catalog_store, product_store
 from apps.catalog.models import (
     Brand,
@@ -58,9 +65,22 @@ def brands_key():
 # ---------------------------------------------------------------------------
 
 
+def _get_or_set(key, loader, **kwargs):
+    """``cache.get_or_set`` whose refills can't cache data older than the
+    last committed catalog change (only matters with a read replica)."""
+    if not replica.configured() or not settings.CACHE_ENABLED:
+        return cache.get_or_set(key, loader, **kwargs)  # nothing a stale read could be stored in
+
+    def consistent_loader():
+        with db_context.require_lsn(consistency.catalog_write_lsn()):
+            return loader()
+
+    return cache.get_or_set(key, consistent_loader, fence=consistency.catalog_fence_key(), **kwargs)
+
+
 def get_product(product_id):
     """``product_store.get_product`` through the cache. Raises ProductDoesNotExist."""
-    return cache.get_or_set(
+    return _get_or_set(
         product_key(product_id),
         lambda: product_store.get_product(product_id),
         policy=PRODUCT_POLICY,
@@ -70,7 +90,7 @@ def get_product(product_id):
 
 def list_categories():
     """Active categories (with product counts) through the cache."""
-    return cache.get_or_set(
+    return _get_or_set(
         categories_key(),
         lambda: catalog_store.list_categories(active_only=True),
         policy=CATALOG_LIST_POLICY,
@@ -79,7 +99,7 @@ def list_categories():
 
 def list_brands():
     """Active brands (with product counts) through the cache."""
-    return cache.get_or_set(
+    return _get_or_set(
         brands_key(),
         lambda: catalog_store.list_brands(active_only=True),
         policy=CATALOG_LIST_POLICY,
@@ -91,11 +111,18 @@ def list_brands():
 # ---------------------------------------------------------------------------
 
 
+def _after_commit(delete):
+    # Fence first: a refill that started before this commit can't store its
+    # (possibly old) value once the keys below are deleted.
+    consistency.note_catalog_write()
+    delete()
+
+
 def invalidate(*keys):
     """Delete ``keys`` once the current transaction commits (now, outside one)."""
     keys = [key for key in keys if key]
     if keys and settings.CACHE_ENABLED:
-        transaction.on_commit(lambda: cache.delete(*keys))
+        transaction.on_commit(lambda: _after_commit(lambda: cache.delete(*keys)))
 
 
 def invalidate_products(product_ids):
@@ -105,7 +132,7 @@ def invalidate_products(product_ids):
 def invalidate_all_products():
     """After bulk changes that bypass signals (e.g. a full stats rebuild)."""
     if settings.CACHE_ENABLED:
-        transaction.on_commit(lambda: cache.delete_prefix("product"))
+        transaction.on_commit(lambda: _after_commit(lambda: cache.delete_prefix("product")))
 
 
 @receiver([post_save, post_delete], sender=Product)

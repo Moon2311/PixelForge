@@ -18,6 +18,7 @@ COUNTERS = (
     "cache_lock_contention_total",
     "cache_lock_timeout_total",
     "cache_rebuild_total",
+    "cache_fenced_skips_total",
     "cache_errors_total",
 )
 

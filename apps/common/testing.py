@@ -1,13 +1,18 @@
-"""Test helpers for code that uses apps.common.cache against a real Redis."""
+"""Test helpers: apps.common.cache against a real Redis, and read-replica
+routing against the ``replica`` test mirror."""
 
 import os
 import unittest
+from unittest import mock
 
+from django.db import OperationalError
 from django.test.utils import override_settings
 from django_redis import get_redis_connection
 from redis.exceptions import RedisError
 
 from apps.common.cache import client, metrics
+from apps.common.db import metrics as db_metrics
+from apps.common.db import replica
 
 # A dedicated database; tests only delete keys under TEST_KEY_PREFIX.
 REDIS_TEST_URL = os.environ.get("REDIS_TEST_URL", "redis://127.0.0.1:6379/15")
@@ -71,3 +76,83 @@ class RedisCacheTestMixin:
         metrics.reset()
         self.addCleanup(flush_test_keys)
         self.addCleanup(client.reset)
+
+
+class FakeReplica:
+    """Stands in for the replica's replication state in tests.
+
+    Queries routed to a replica really run, on its test mirror (the same
+    test database), so tests see which connection served them.
+    Only the replication facts are simulated: ``replay_lsn`` None means
+    "caught up with the primary", an int means "replayed up to there";
+    ``down`` makes every probe fail like an unreachable server.
+    """
+
+    def __init__(self):
+        self.down = False
+        self.in_recovery = True
+        self.replay_lsn = None
+        self.replay_age = 0.0
+
+    def _replayed(self):
+        return replica.primary_lsn() if self.replay_lsn is None else self.replay_lsn
+
+    def probe(self):
+        if self.down:
+            raise OperationalError("could not connect to the read replica (test)")
+        return {
+            "in_recovery": self.in_recovery,
+            "replay_lsn": self._replayed(),
+            "replay_age": self.replay_age,
+            "primary_lsn": replica.primary_lsn(),
+        }
+
+    def replay(self):
+        if self.down:
+            raise OperationalError("could not connect to the read replica (test)")
+        return self._replayed()
+
+
+class ReplicaRoutingTestMixin:
+    """Turns read routing on against test mirrors (``replica_aliases``), with
+    each replica's replication state simulated by ``self.fake_replicas[alias]``
+    (``self.fake_replica`` is the first one).
+
+    Use with TransactionTestCase: a mirror is a second connection, so it only
+    sees committed data. ``set_replica(...)`` changes the simulated state and
+    forgets the cached health checks.
+    """
+
+    replica_aliases = ("replica",)
+    databases = {"default", "replica"}
+
+    def setUp(self):
+        super().setUp()
+        self.fake_replicas = {alias: FakeReplica() for alias in self.replica_aliases}
+        self.fake_replica = self.fake_replicas[self.replica_aliases[0]]
+        for name, method in (("_probe", "probe"), ("_replay_lsn", "replay")):
+            patcher = mock.patch(
+                f"apps.common.db.replica.{name}",
+                side_effect=lambda alias, method=method: getattr(self.fake_replicas[alias], method)(),
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        routing = override_settings(
+            READ_REPLICA_ENABLED=True,
+            READ_REPLICA_ALIASES=list(self.replica_aliases),
+            RECENT_WRITE_TTL=30,
+            REPLICA_MAX_LAG=10.0,
+            REPLICA_HEALTH_INTERVAL=3600.0,  # re-checked only via set_replica() / fresh checks
+            REPLICA_FAILURE_COOLDOWN=3600,
+        )
+        routing.enable()
+        self.addCleanup(routing.disable)
+        replica.reset()
+        db_metrics.reset()
+        self.addCleanup(replica.reset)
+
+    def set_replica(self, alias=None, **state):
+        fake = self.fake_replicas[alias] if alias else self.fake_replica
+        for name, value in state.items():
+            setattr(fake, name, value)
+        replica.reset()

@@ -19,6 +19,11 @@
   database being down) are never cached.
 * **Avalanche:** every TTL is ``ttl + random(0, jitter)``, so entries
   written together don't all expire in the same second.
+* **Fence (optional):** ``fence=<redis key>`` stores a rebuilt value only if
+  that key still holds what it held before the loader ran (atomic
+  compare-and-set). Writers change the fence before invalidating, so a
+  rebuild that read old data (e.g. from a lagging read replica) is returned
+  but never cached after the invalidation. See apps.common.db.consistency.
 
 Redis values are JSON envelopes, so a miss (no key), a cached ``None`` and a
 cached "not found" can't be confused::
@@ -136,12 +141,35 @@ def _read(key):
     return _decode(raw, key)
 
 
-def _write(key, envelope, ttl):
+# KEYS[1]=entry, KEYS[2]=fence, ARGV[1]=payload, ARGV[2]=TTL, ARGV[3]=expected fence value.
+_FENCED_SET_SCRIPT = """
+if (redis.call("get", KEYS[2]) or "") ~= ARGV[3] then
+    return 0
+end
+redis.call("set", KEYS[1], ARGV[1], "EX", ARGV[2])
+return 1
+"""
+
+
+def _write(key, envelope, ttl, fence=None, expected=""):
+    """Store ``envelope``. With a ``fence`` key, only if it still holds ``expected``."""
     payload = _encode(envelope, key)
     if payload is None:
         return False
     try:
-        client.run("set", lambda r: r.set(key, payload, ex=ttl))
+        if fence is None:
+            client.run("set", lambda r: r.set(key, payload, ex=ttl))
+        else:
+            stored = client.run(
+                "fenced set",
+                lambda r: r.register_script(_FENCED_SET_SCRIPT)(
+                    keys=[key, fence], args=[payload, ttl, expected]
+                ),
+            )
+            if not stored:
+                metrics.incr("cache_fenced_skips_total")
+                logger.debug("cache not stored %s: changed while it was loading", key)
+                return False
     except client.CacheUnavailable:
         return False
     metrics.incr("cache_sets_total")
@@ -242,25 +270,44 @@ def _lookup(key, not_found, count_miss=True):
     return value
 
 
-def _rebuild(key, loader, policy, not_found):
+def _fence_value(fence):
+    """The fence's current value ("" if unset), or None if Redis can't be read."""
+    try:
+        raw = client.run("fence read", lambda r: r.get(fence))
+    except client.CacheUnavailable:
+        return None
+    return raw.decode() if isinstance(raw, bytes) else (raw or "")
+
+
+def _rebuild(key, loader, policy, not_found, fence=None):
     metrics.incr("cache_rebuild_total")
+    store = {}
+    if fence is not None:
+        # Read before the loader runs: a change during the load blocks the store.
+        expected = _fence_value(fence)
+        store = {"fence": fence, "expected": expected}
+        if expected is None:
+            return loader()  # Redis failed: nothing could be stored anyway
     try:
         value = loader()
     except not_found as exc:
         ttl = policy.not_found_ttl()
         if ttl is not None:
-            _write(key, {"nf": str(exc)}, ttl)
+            _write(key, {"nf": str(exc)}, ttl, **store)
         raise
-    _write(key, {"v": value}, policy.value_ttl())
+    _write(key, {"v": value}, policy.value_ttl(), **store)
     return value
 
 
-def get_or_set(key, loader, policy=DEFAULT_POLICY, not_found=()):
+def get_or_set(key, loader, policy=DEFAULT_POLICY, not_found=(), fence=None):
     """Return the cached value for ``key``, loading it with ``loader()`` on a miss.
 
     ``not_found``: exception class(es) meaning "does not exist". They are
     negative-cached and re-raised (as the first class, with the original
     message) on later reads. Any other exception propagates uncached.
+
+    ``fence``: optional Redis key; the loaded value is stored only if the
+    fence is unchanged since the load started (see the module docstring).
     """
     if not isinstance(not_found, tuple):
         not_found = (not_found,)
@@ -284,7 +331,7 @@ def get_or_set(key, loader, policy=DEFAULT_POLICY, not_found=()):
                 value = _lookup(key, not_found, count_miss=False)
                 if value is not _MISS:
                     return value
-                return _rebuild(key, loader, policy, not_found)
+                return _rebuild(key, loader, policy, not_found, fence)
             finally:
                 locks.release_lock(lock, token)
 
