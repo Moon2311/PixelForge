@@ -99,3 +99,8 @@ ENV/
 # Django
 media/
 staticfiles/
+
+# Load balancer TLS material (nginx/certs/README.md)
+nginx/certs/*.crt
+nginx/certs/*.key
+nginx/certs/*.pem

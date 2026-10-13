@@ -1,0 +1,48 @@
+# PixelForge L7 load balancer (rendered by 40-pixelforge-config.sh).
+# HTTP load balancing over the Django instances. Not related to the
+# HAProxy writer/reader endpoints in docker-compose.ha.yml (PostgreSQL TCP).
+
+# Docker's embedded DNS, for the `resolve` upstream servers.
+resolver 127.0.0.11 valid=10s ipv6=off;
+resolver_timeout 3s;
+
+server_tokens off;
+
+# Correlation id: the client's when given (Django validates it), else nginx's.
+map $http_x_request_id $pf_request_id {
+    default $http_x_request_id;
+    ""      $request_id;
+}
+
+log_format pixelforge '$remote_addr - [$time_local] "$request" $status $body_bytes_sent '
+                      'rt=$request_time upstream=$upstream_addr ust=$upstream_status '
+                      'urt=$upstream_response_time rid=$pf_request_id';
+
+upstream pixelforge_backend {
+    # Shared memory so all nginx workers agree on which instance is down,
+    # and required by `resolve`.
+    zone pixelforge_backend 64k;
+    # Requests are spread by fewest active connections. No stickiness: the
+    # instances are stateless (sessions in PostgreSQL, cache and
+    # read-your-writes markers in Redis, media on a shared volume).
+    least_conn;
+    include /etc/nginx/pixelforge/upstream-servers.conf;
+}
+
+server {
+    listen 80 default_server;
+    server_name _;
+    access_log /var/log/nginx/access.log pixelforge;
+
+    # nginx's own liveness, for the container health check. A file, not
+    # `return`: `return` would answer before allow/deny are checked.
+    location = /nginx-health {
+        access_log off;
+        allow 127.0.0.1;
+        deny all;
+        default_type text/plain;
+        alias /etc/nginx/pixelforge/health.txt;
+    }
+
+    include /etc/nginx/pixelforge/http-locations.conf;
+}

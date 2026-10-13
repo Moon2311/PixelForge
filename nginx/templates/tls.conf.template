@@ -1,0 +1,20 @@
+
+# HTTPS: TLS terminates here; the instances get plain HTTP plus
+# X-Forwarded-Proto: https (Django's SECURE_PROXY_SSL_HEADER).
+server {
+    listen 443 ssl default_server;
+    http2 on;
+    server_name _;
+    access_log /var/log/nginx/access.log pixelforge;
+
+    ssl_certificate ${NGINX_TLS_CERT};
+    ssl_certificate_key ${NGINX_TLS_KEY};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:pixelforge_tls:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    include /etc/nginx/pixelforge/hsts.conf;
+    include /etc/nginx/pixelforge/proxy.conf;
+}

@@ -1,42 +1,253 @@
 # Development environment: `docker compose up --build`
-# Backend (all modules) on http://localhost:8000.
-# PostgreSQL primary on localhost:5433, read replica (streaming replication) on localhost:5434.
-# Redis (cache only) is reachable from the backend container, not from the host.
+#
+#   lb                    nginx L7 load balancer on http://localhost:8000 (and :8443 with a certificate)
+#   backend-1, backend-2  Django instances (Gunicorn), reachable only through the load balancer
+#   migrate               one-shot: applies migrations before the instances start
+#   kafka                 single KRaft broker (no ZooKeeper); host access on 127.0.0.1:9094 for tests
+#   kafka-init            one-shot: creates the topics
+#   outbox-publisher      publishes outbox rows to Kafka
+#   worker-*              consumer groups: notifications (x2), images, audit, dlq-archiver
+#   postgres              PostgreSQL primary on 127.0.0.1:5433
+#   postgres-replica      read replica (streaming replication) on 127.0.0.1:5434
+#   redis                 cache only, Compose network only
+#
+# Single backend without Kafka or the load balancer (events processed in-process):
+#   docker compose up --build backend          # http://localhost:8000; don't run it together with `lb`
+#
+# See README "L7 load balancer" and "Background tasks (Kafka)".
+
+x-app-env: &app-env
+  DB_PRIMARY_HOST: postgres
+  DB_PRIMARY_NAME: pixelforge
+  DB_PRIMARY_USER: pixelforge
+  DB_PRIMARY_PASSWORD: ${POSTGRES_PASSWORD:-pixelforge}
+  # Name/user/password default to the primary's (they replicate).
+  DB_REPLICA_HOST: postgres-replica
+  SECRET_KEY: ${SECRET_KEY:-django-insecure-docker-dev-only}
+  DEBUG: ${DEBUG:-True}
+  PASSWORD_RESET_URL: ${PASSWORD_RESET_URL:-http://localhost:5173/reset-password}
+  REDIS_URL: redis://redis:6379/1
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  EVENTS_RETRY_MAX_ATTEMPTS: ${EVENTS_RETRY_MAX_ATTEMPTS:-5}
+  EVENTS_RETRY_BASE_DELAY: ${EVENTS_RETRY_BASE_DELAY:-1}
+  EVENTS_RETRY_MAX_DELAY: ${EVENTS_RETRY_MAX_DELAY:-300}
+  EVENTS_TASK_TIMEOUT: ${EVENTS_TASK_TIMEOUT:-60}
+  EMAIL_BACKEND: ${EMAIL_BACKEND:-django.core.mail.backends.console.EmailBackend}
+  ALERT_EMAILS: ${ALERT_EMAILS:-}
+
+x-app: &app
+  build: .
+  image: pixelforge-backend:dev
+  environment:
+    <<: *app-env
+  volumes:
+    # Code (live reload of the source) and media: shared by every instance,
+    # the image workers and nginx.
+    - .:/app
+  depends_on: &app-depends
+    postgres:
+      condition: service_healthy
+    # The app works without Redis or the replica (it reads the primary), so only start them first.
+    postgres-replica:
+      condition: service_started
+    redis:
+      condition: service_started
+
+x-backend-instance: &backend-instance
+  <<: *app
+  command: >
+    gunicorn config.wsgi:application --bind 0.0.0.0:8000
+    --workers ${GUNICORN_WORKERS:-3} --timeout 60 --graceful-timeout 30 --access-logfile -
+  # No host ports: only the load balancer reaches the instances.
+  expose: ["8000"]
+  networks: [default, edge]
+  restart: unless-stopped
+  stop_grace_period: 35s
+  depends_on:
+    <<: *app-depends
+    migrate:
+      condition: service_completed_successfully
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/', timeout=4)"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 20s
+
+x-worker: &worker
+  <<: *app
+  restart: unless-stopped
+  # Lets the current task finish before Kafka hands the partitions over.
+  stop_grace_period: 75s
+  depends_on:
+    <<: *app-depends
+    migrate:
+      condition: service_completed_successfully
+    kafka-init:
+      condition: service_completed_successfully
+
 services:
+  lb:
+    image: nginx:1.30.5-alpine
+    ports:
+      - "${LB_HTTP_PORT:-8000}:80"
+      - "${LB_HTTPS_PORT:-8443}:443"
+    environment:
+      # Upstream instances (host:port, comma or space separated).
+      BACKEND_UPSTREAMS: ${BACKEND_UPSTREAMS:-backend-1:8000,backend-2:8000}
+      NGINX_MAX_FAILS: ${NGINX_MAX_FAILS:-3}
+      NGINX_FAIL_TIMEOUT: ${NGINX_FAIL_TIMEOUT:-10s}
+      NGINX_PROXY_CONNECT_TIMEOUT: ${NGINX_PROXY_CONNECT_TIMEOUT:-3s}
+      NGINX_PROXY_READ_TIMEOUT: ${NGINX_PROXY_READ_TIMEOUT:-65s}
+      NGINX_CLIENT_MAX_BODY_SIZE: ${NGINX_CLIENT_MAX_BODY_SIZE:-25m}
+      # HTTPS is served when both files exist (see nginx/certs/README.md).
+      NGINX_TLS_CERT: /etc/nginx/certs/tls.crt
+      NGINX_TLS_KEY: /etc/nginx/certs/tls.key
+      NGINX_REDIRECT_HTTPS: ${NGINX_REDIRECT_HTTPS:-false}
+      NGINX_HSTS: ${NGINX_HSTS:-false}
+    volumes:
+      - ./nginx/templates:/etc/nginx/pixelforge-templates:ro
+      - ./nginx/entrypoint.d/40-pixelforge-config.sh:/docker-entrypoint.d/40-pixelforge-config.sh:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - ./media:/srv/media:ro
+    # Only the edge network: the load balancer can't reach PostgreSQL, Redis or Kafka.
+    networks: [edge]
+    restart: unless-stopped
+    depends_on:
+      backend-1:
+        condition: service_started
+      backend-2:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  backend-1:
+    <<: *backend-instance
+    hostname: backend-1
+    environment:
+      <<: *app-env
+      INSTANCE_NAME: backend-1
+      # Forwarded headers are believed only from the load balancer.
+      TRUSTED_PROXIES: lb
+
+  backend-2:
+    <<: *backend-instance
+    hostname: backend-2
+    environment:
+      <<: *app-env
+      INSTANCE_NAME: backend-2
+      TRUSTED_PROXIES: lb
+
+  migrate:
+    <<: *app
+    command: python manage.py migrate --noinput
+    restart: "no"
+
+  # Single-instance mode without the load balancer and Kafka (EVENTS_BACKEND
+  # inline), as before: `docker compose up --build backend`.
   backend:
-    build: .
+    <<: *app
+    profiles: ["single"]
     command: >
       sh -c "python manage.py migrate --noinput &&
              python manage.py runserver 0.0.0.0:8000"
     ports:
       - "8000:8000"
     environment:
-      DB_PRIMARY_HOST: postgres
-      DB_PRIMARY_NAME: pixelforge
-      DB_PRIMARY_USER: pixelforge
-      DB_PRIMARY_PASSWORD: pixelforge
-      # Name/user/password default to the primary's (they replicate).
-      DB_REPLICA_HOST: postgres-replica
-      SECRET_KEY: ${SECRET_KEY:-django-insecure-docker-dev-only}
-      DEBUG: "True"
-      PASSWORD_RESET_URL: ${PASSWORD_RESET_URL:-http://localhost:5173/reset-password}
-      REDIS_URL: redis://redis:6379/1
-    volumes:
-      - .:/app
-    depends_on:
-      postgres:
-        condition: service_healthy
-      # The backend works without Redis or the replica (it reads the primary), so only start them first.
-      postgres-replica:
-        condition: service_started
-      redis:
-        condition: service_started
+      <<: *app-env
+      KAFKA_BOOTSTRAP_SERVERS: ""
+      EVENTS_BACKEND: inline
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/')"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
+
+  kafka:
+    image: apache/kafka:4.3.1
+    hostname: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,HOST://localhost:${KAFKA_HOST_PORT:-9094}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # One broker: internal topics can't have more replicas.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics come from `kafka_create_topics` only: a typo can't create one.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS:--Xms512m -Xmx512m}
+      # Fixed so the data volume stays valid across container re-creation.
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-ZsUk_PKTS6-a507N6urRJg}
+    ports:
+      # Host access for integration tests and tooling, loopback only.
+      - "127.0.0.1:${KAFKA_HOST_PORT:-9094}:9094"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-init:
+    <<: *app
+    command: python manage.py kafka_create_topics --wait 120
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  outbox-publisher:
+    <<: *worker
+    command: python manage.py outbox_publisher
+    healthcheck:
+      test: ["CMD", "python", "manage.py", "events_healthcheck", "outbox-publisher"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+
+  worker-notifications:
+    <<: *worker
+    command: python manage.py kafka_worker notifications
+    # Two members of one consumer group: Kafka splits the partitions between them.
+    deploy:
+      replicas: ${NOTIFICATION_WORKERS:-2}
+    healthcheck: &worker-healthcheck
+      test: ["CMD", "python", "manage.py", "events_healthcheck", "worker"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+
+  worker-images:
+    <<: *worker
+    command: python manage.py kafka_worker images
+    healthcheck: *worker-healthcheck
+
+  worker-audit:
+    <<: *worker
+    command: python manage.py kafka_worker audit
+    healthcheck: *worker-healthcheck
+
+  worker-dlq:
+    <<: *worker
+    command: python manage.py kafka_worker dlq-archiver
+    healthcheck: *worker-healthcheck
 
   postgres:
     image: postgres:16-alpine
@@ -46,11 +257,12 @@ services:
     environment:
       POSTGRES_DB: pixelforge
       POSTGRES_USER: pixelforge
-      POSTGRES_PASSWORD: pixelforge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pixelforge}
       POSTGRES_REPLICATION_USER: replicator
       POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-replicator-dev-only}
     ports:
-      - "5433:5432"
+      # Loopback only: not reachable from other machines.
+      - "127.0.0.1:5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # Replication role + pg_hba rule; runs on a new volume (see the script for existing ones).
@@ -71,7 +283,7 @@ services:
       REPLICATION_USER: replicator
       PGPASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-replicator-dev-only}
     ports:
-      - "5434:5432"
+      - "127.0.0.1:5434:5432"
     volumes:
       - postgres_replica_data:/var/lib/postgresql/data
       - ./docker/postgres/replica-entrypoint.sh:/replica-entrypoint.sh:ro
@@ -94,6 +306,11 @@ services:
       timeout: 3s
       retries: 10
 
+networks:
+  # Load balancer <-> application instances only.
+  edge: {}
+
 volumes:
   postgres_data:
   postgres_replica_data:
+  kafka_data:

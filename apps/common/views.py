@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import connection
 from rest_framework import status
 from rest_framework.views import APIView
@@ -7,6 +8,7 @@ from apps.common.cache import metrics as cache_metrics
 from apps.common.custom_response import CustomResponse
 from apps.common.db import cluster, replica
 from apps.common.db import metrics as db_metrics
+from apps.events import health as events_health
 
 # Replica states that still serve every request (from the primary), but slower.
 _REPLICA_DEGRADED = replica.DEGRADED
@@ -22,7 +24,7 @@ def _primary_check():
 
 
 class HealthCheckView(APIView):
-    """GET /api/health/ — application, PostgreSQL and Redis health.
+    """GET /api/health/ — application, PostgreSQL, Redis and event pipeline health.
 
     PostgreSQL (the primary) down is "unhealthy" (503). Redis down, or the
     read replica unavailable or lagging, is only "degraded" (200): reads
@@ -34,7 +36,13 @@ class HealthCheckView(APIView):
     permission_classes = []
 
     def get(self, request):
-        health = {"status": "healthy", "service": "pixelforge", "checks": {"django": {"status": "ok"}}}
+        health = {
+            "status": "healthy",
+            "service": "pixelforge",
+            # Which instance behind the load balancer answered.
+            "instance": settings.INSTANCE_NAME,
+            "checks": {"django": {"status": "ok"}},
+        }
         health["checks"]["database"] = _primary_check()
         if health["checks"]["database"]["status"] != "ok":
             health["status"] = "unhealthy"
@@ -46,6 +54,12 @@ class HealthCheckView(APIView):
         redis_status = cache_client.ping()
         health["checks"]["redis"] = {"status": redis_status, "cache_metrics": cache_metrics.snapshot()}
         if redis_status == "error" and health["status"] == "healthy":
+            health["status"] = "degraded"
+
+        # Kafka down or a growing outbox is "degraded": requests still
+        # succeed and their events wait in the outbox (PostgreSQL).
+        health["checks"]["events"] = events_health.summary()
+        if health["checks"]["events"]["status"] != "healthy" and health["status"] == "healthy":
             health["status"] = "degraded"
 
         if health["status"] == "unhealthy":
@@ -113,6 +127,7 @@ class ApiRootView(APIView):
             "endpoints": {
                 "health": "/api/health/",
                 "database_health": "/api/health/database/",
+                "events_health": "/api/health/events/",
                 "auth": "/api/auth/",
                 "catalog": "/api/catalog/",
                 "search": "/api/search/products/?q=",

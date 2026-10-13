@@ -43,7 +43,10 @@ class ForgotPasswordTests(APITestCase):
         self.buyer = make_user("buyer", "buyer@example.com", "buyer")
 
     def test_sends_reset_link_without_exposing_token(self):
-        response = self.client.post(FORGOT_URL, {"email": "BUYER@example.com"})
+        # The email is sent by the notification task after the commit
+        # (inline mode in tests; a Kafka worker in production).
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(FORGOT_URL, {"email": "BUYER@example.com"})
 
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.data["data"])
@@ -67,20 +70,23 @@ class ForgotPasswordTests(APITestCase):
         mail.outbox.clear()
 
         for email in ["nobody@example.com", "manager@example.com"]:
-            response = self.client.post(FORGOT_URL, {"email": email})
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(FORGOT_URL, {"email": email})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.data, known.data)
         self.assertEqual(len(mail.outbox), 0)
 
     def test_duplicate_emails_do_not_crash(self):
         make_user("buyer2", "buyer@example.com", "buyer")
-        response = self.client.post(FORGOT_URL, {"email": "buyer@example.com"})
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(FORGOT_URL, {"email": "buyer@example.com"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(mail.outbox), 2)
 
     def test_user_without_profile_is_ignored(self):
         User.objects.create_user("noprofile", "np@example.com", "Old-pass-123!")
-        response = self.client.post(FORGOT_URL, {"email": "np@example.com"})
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(FORGOT_URL, {"email": "np@example.com"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(mail.outbox), 0)
 
@@ -100,7 +106,8 @@ class ResetPasswordTests(APITestCase):
         self.buyer = make_user("buyer", "buyer@example.com", "buyer")
 
     def test_resets_password_and_notifies_user(self):
-        response = self.client.post(RESET_URL, reset_payload(self.buyer))
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(RESET_URL, reset_payload(self.buyer))
 
         self.assertEqual(response.status_code, 200)
         self.buyer.refresh_from_db()

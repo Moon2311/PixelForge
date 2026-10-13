@@ -709,3 +709,34 @@ class RecentlyViewed(models.Model):
 
     def __str__(self):
         return f"user {self.user_id} -> #{self.product_id} {self.product_name}"
+
+
+# ---------------------------------------------------------------------------
+# Image processing (background, see apps/catalog/images.py)
+# ---------------------------------------------------------------------------
+
+
+class ProcessedImage(models.Model):
+    """Optimised variants of an uploaded product image, made by the
+    ``images`` workers after the upload (the original file is kept as is)."""
+
+    STATUS_DONE = "done"
+    STATUS_SKIPPED = "skipped"
+    STATUS_CHOICES = [(STATUS_DONE, "Done"), (STATUS_SKIPPED, "Skipped")]
+
+    # Path relative to MEDIA_ROOT, e.g. products/<uuid>.jpg.
+    source_path = models.CharField(max_length=255, unique=True)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_DONE)
+    width = models.PositiveIntegerField(null=True, blank=True)
+    height = models.PositiveIntegerField(null=True, blank=True)
+    original_bytes = models.PositiveIntegerField(default=0)
+    # {"w320": {"path": ..., "bytes": ..., "width": ..., "height": ...}, ...}
+    variants = models.JSONField(default=dict, blank=True)
+    note = models.CharField(max_length=255, blank=True, default="")
+    processed_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "apps_processedimage"
+
+    def __str__(self):
+        return f"{self.source_path} ({self.status})"

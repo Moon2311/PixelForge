@@ -16,6 +16,8 @@ from apps.catalog.legacy_inventory_serializers import LegacyInventoryLogSerializ
 from apps.catalog.models import Product, RecentlyViewed
 from apps.authentication.permissions import IsAdmin
 from apps.catalog import cache as catalog_cache, catalog_store, product_store
+from apps.catalog import images as image_processing
+from apps.events import outbox
 from apps.search import services as search_services
 from apps.catalog.legacy_serializers import (
     CatalogSerializer,
@@ -57,6 +59,8 @@ def _save_uploaded_image(request, upload):
     ext = os.path.splitext(upload.name)[1].lower()
     filename = f"products/{uuid.uuid4().hex}{ext}"
     path = default_storage.save(filename, ContentFile(upload.read()))
+    # Resized/stripped variants are made by the image workers, not here.
+    image_processing.queue_processing(path)
     return request.build_absolute_uri(settings.MEDIA_URL + path)
 
 
@@ -102,6 +106,11 @@ def collect_images(request):
 def _actor_id(request):
     user = getattr(request, "user", None)
     return getattr(user, "pk", None) if user else None
+
+
+def _audit_product(event_type, request, product_id):
+    outbox.audit(event_type, aggregate_type="product", aggregate_id=product_id or "",
+                 actor_user_id=_actor_id(request))
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +184,7 @@ class ListProductsView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
+        _audit_product("audit.product_created", request, doc.get("id"))
         return CustomResponse.successful_response(
             doc,
             "Product created successfully",
@@ -266,6 +276,7 @@ class ProductDetailView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
+        _audit_product("audit.product_updated", request, product_id)
         return CustomResponse.successful_response(doc, "Product updated successfully")
 
     def put(self, request, product_id):
@@ -284,6 +295,7 @@ class ProductDetailView(APIView):
                 str(e),
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+        _audit_product("audit.product_deleted", request, product_id)
         return CustomResponse.successful_response(message="Product deleted successfully")
 
 

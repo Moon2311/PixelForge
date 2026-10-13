@@ -14,6 +14,7 @@ from apps.cart.models import Cart
 from apps.catalog.inventory import InsufficientStockError, InventoryManager
 from apps.catalog.models import InventoryLog
 from apps.catalog.selectors import get_product
+from apps.events import outbox, topics
 from apps.payments.services import enabled_order_methods
 
 from .models import Order, OrderItem
@@ -163,6 +164,21 @@ def place_order(user, data):
                       "name": product["name"]}],
                 ) from None
         cart.items.all().delete()
+        # Same transaction as the order: committed together or not at all.
+        # Emails and the audit record are sent by the workers.
+        outbox.enqueue(
+            "order.placed", topic=topics.ORDER_EVENTS, aggregate_type="order", aggregate_id=order.number,
+            payload={
+                "order_number": order.number,
+                "order_id": order.pk,
+                "user_id": order.user_id,
+                "status": order.status,
+                "payment_method": order.payment_method,
+                "total": order.total,
+                "currency": "PKR",
+                "item_count": sum(qty for _, qty, _ in lines),
+            },
+        )
     return order
 
 

@@ -1,58 +1,92 @@
 # PixelForge Backend
 
-Backend for PixelForge: a **modular monolith**. One Django project and one
-process serve every module (authentication, catalog, search, cart, orders,
-payments) from **one PostgreSQL primary**. PostgreSQL handles both the
-transactional data and all search, filtering, sorting and faceting. An
-optional **read replica** (asynchronous streaming replication) serves the
-read-heavy public catalog, with read-your-writes protection (see
-[Read replica](#read-replica)). **Redis** is an optional shared cache in
-front of hot catalog reads; the primary stays the source of truth (see
-[Caching](#caching-redis)).
+Backend for PixelForge: a **modular monolith**. One Django project serves
+every module (authentication, catalog, search, cart, orders, payments) from
+**one PostgreSQL primary**. PostgreSQL handles both the transactional data
+and all search, filtering, sorting and faceting. An optional **read
+replica** (asynchronous streaming replication) serves the read-heavy public
+catalog, with read-your-writes protection (see [Read replica](#read-replica)).
+**Redis** is an optional shared cache in front of hot catalog reads; the
+primary stays the source of truth (see [Caching](#caching-redis)).
+
+Several identical, stateless instances of the monolith run behind an
+**nginx L7 load balancer** (see [L7 load balancer](#l7-load-balancer)).
+Work that doesn't have to happen inside the request (emails, image
+optimisation, audit records) is written to a **transactional outbox** in
+the same PostgreSQL transaction as the business change, published to
+**Kafka**, and done by **consumer workers** with retries, a dead-letter
+queue and idempotency (see [Background tasks](#background-tasks-kafka)).
 
 ```
-                 React frontend
-                        │
-                        ▼
-            Django modular monolith :8000
-                        │
-     ┌──────────────┬───┴──────────┬──────────────┐
-     ▼              ▼              ▼              ▼
-Authentication   Catalog  ◄──── Search     Cart / Orders / Payments
-     │              ▲              │              │
-     │              └─ in-process calls (no HTTP) ┘
-     └──────────────┴──────┬───────┴──────────────┘
-                           ▼
-   Redis (cache) ◄── catalog reads ──► PostgreSQL primary ── async WAL ──► PostgreSQL replica
-   copies only,                        (every write; source               (catalog/search reads
-   may be lost                          of truth)                           that are safe to serve)
+                         React frontend / browsers
+                                   │  HTTP(S)
+                                   ▼
+                    nginx L7 load balancer :8000 (:8443 TLS)
+              least_conn, passive health checks, retries, X-Forwarded-*
+                  ┌────────────────┴────────────────┐
+                  ▼                                 ▼
+     Django instance backend-1          Django instance backend-2       (stateless, same code)
+     modular monolith: auth · catalog · search · cart · orders · payments
+                  │  one transaction: business rows + outbox row
+                  ▼
+   Redis (cache, ◄── PostgreSQL primary ── async WAL ──► replica(s)
+   RYW markers)       (source of truth, outbox,          (catalog/search reads)
+                       idempotency records)
+                          │ ▲
+         outbox-publisher │ │ ProcessedEvent / Notification / AuditEvent rows
+                          ▼ │
+                 Kafka (KRaft) topics ──► consumer groups (kafka_worker):
+                 order-events               notifications ×2  (emails)
+                 payment-events             images           (WebP variants)
+                 inventory-events           audit            (audit trail)
+                 notification-events        dlq-archiver     (DLQ archive)
+                 image-processing
+                 audit-events, retry-events, dead-letter-events
 ```
 
-There is no Elasticsearch, message broker, Celery or internal HTTP between
-modules.
+The modules still call each other in-process (no HTTP between modules) and
+there is no Elasticsearch or Celery. Kafka only carries background work:
+checkout, stock reservation, payment verification and payment state changes
+stay synchronous and transactional.
 
 ## Quick start
 
 **Docker (one command):**
 
 ```bash
-docker compose up --build
+docker compose up --build          # stop with: docker compose down  (volumes are kept)
 ```
 
-The backend is at `http://localhost:8000` and runs migrations on start. The PostgreSQL primary is published on
-host port `5433` and the read replica on `5434`; Redis runs inside the Compose network only. On first start the
-replica clones the primary (`pg_basebackup`) and then streams its WAL. A `postgres_data` volume created before
-the replica was added needs the replication role once (see [Read replica](#docker)).
-Seed demo data with:
+The API is at `http://localhost:8000`, served by the nginx load balancer in
+front of two Django instances (`backend-1`, `backend-2`; no host ports of
+their own). A one-shot `migrate` service applies migrations before they start
+and `kafka-init` creates the Kafka topics; then `outbox-publisher` and the
+workers (`worker-notifications` ×2, `worker-images`, `worker-audit`,
+`worker-dlq`) start. The PostgreSQL primary is published on `127.0.0.1:5433`
+and the read replica on `127.0.0.1:5434`, Kafka's host listener on
+`127.0.0.1:9094` (tests, tooling); Redis runs inside the Compose network only.
+On first start the replica clones the primary (`pg_basebackup`) and then
+streams its WAL. A `postgres_data` volume created before the replica was
+added needs the replication role once (see [Read replica](#docker)).
+Emails are printed by the notification workers (`docker compose logs -f
+worker-notifications`) unless `EMAIL_BACKEND` is set. Seed demo data with:
 
 ```bash
-docker compose exec backend python manage.py seed_users
-docker compose exec backend python manage.py seed_inventory --count 50
-docker compose exec backend python manage.py seed_catalog
+docker compose exec backend-1 python manage.py seed_users
+docker compose exec backend-1 python manage.py seed_inventory --count 50
+docker compose exec backend-1 python manage.py seed_catalog
+```
+
+**Single backend, no load balancer or Kafka** (the previous setup; events are
+processed in-process after each commit, see [Inline mode](#inline-mode-no-kafka)):
+
+```bash
+docker compose up --build backend  # http://localhost:8000; stop `lb` first if the full stack runs
 ```
 
 **Local (without Docker)** uses [uv](https://docs.astral.sh/uv/) and requires PostgreSQL on `localhost:5432`
-(no replica needed: without `DB_REPLICA_HOST`/`DATABASE_REPLICA_URL` every query uses that one database, as before).
+(no replica needed: without `DB_REPLICA_HOST`/`DATABASE_REPLICA_URL` every query uses that one database, as before;
+no Kafka needed: without `KAFKA_BOOTSTRAP_SERVERS` background tasks run in-process after each commit).
 Redis on `localhost:6379` is optional (`sudo apt install redis-server`, `brew install redis`, or
 `docker run -d -p 127.0.0.1:6379:6379 redis:7-alpine`); without it every read goes to PostgreSQL.
 
@@ -66,8 +100,10 @@ uv run manage.py runserver            # http://localhost:8000
 ```
 
 **Tests:** `uv run manage.py test` (needs a PostgreSQL user that can create the test database and the `pg_trgm` extension).
-The suite runs with the cache off; the cache tests use Redis at `REDIS_TEST_URL` (default `redis://127.0.0.1:6379/15`)
-and are skipped when it isn't reachable.
+The suite runs with the cache off and events in inline mode; the cache tests use Redis at `REDIS_TEST_URL` (default
+`redis://127.0.0.1:6379/15`), the Kafka integration tests a real broker at `KAFKA_TEST_BOOTSTRAP_SERVERS` (default
+`localhost:9094`, i.e. `docker compose up -d kafka`), and the load balancer tests the running stack at `LB_TEST_URL`;
+each group is skipped when its service isn't reachable or configured. See [Testing the pipeline](#testing-the-pipeline).
 
 **Dependencies** live in `pyproject.toml` and are pinned in `uv.lock`: `uv add <package>` to add one, `uv lock --upgrade` to refresh.
 
@@ -78,18 +114,21 @@ PixelForge/
 ├── manage.py
 ├── pyproject.toml, uv.lock   # dependencies (uv)
 ├── Dockerfile, docker-compose.yml, .env.example
-├── config/                 # settings.py (primary + optional replica), urls.py, wsgi.py, asgi.py
+├── config/                 # settings.py (primary + optional replica, proxy, Kafka), urls.py, wsgi.py, asgi.py
 ├── docker-compose.ha.yml   # HA cluster: Patroni nodes, etcd, HAProxy, reconciler
 ├── docker/postgres/        # primary replication setup, replica entrypoint (pg_basebackup)
 ├── docker/patroni/         # PostgreSQL 16 + Patroni image, patroni.yml, bootstrap
 ├── docker/haproxy/         # writer/reader endpoints
 ├── docker/ha-reconciler/   # replica-count reconciler
 ├── scripts/ha/             # failure scenarios, import of existing data
-├── nginx/nginx.conf        # optional production reverse proxy (single upstream)
+├── nginx/                  # L7 load balancer: templates/ (upstreams, proxying, TLS),
+│                           # entrypoint.d/ (renders them from env), certs/ (TLS files, git-ignored)
 ├── scripts/
+│   ├── lb/check_lb.sh      # load balancer failover check against the running stack
 │   └── merge_legacy_databases.sh   # one-off copy from the old per-service databases
 └── apps/
-    ├── common/             # health checks, uniform APIResponse, test_db_connection
+    ├── common/             # health checks, uniform APIResponse, test_db_connection,
+    │                       # proxy.py (trusted X-Forwarded-*, request ids), logging.py (JSON logs)
     │   ├── cache/          # Redis cache service: manager (cache-aside, negative cache, TTL jitter,
     │   │                   # fenced refills), locks (rebuild mutex), keys, client (failure handling), metrics
     │   └── db/             # read replicas: router, middleware, consistency (LSN markers),
@@ -112,11 +151,26 @@ PixelForge/
     │   └── views.py, urls.py
     ├── cart/               # user and guest carts; validates products via catalog.selectors
     ├── orders/             # checkout: orders from the user's cart, stock via catalog.inventory
-    └── payments/           # JazzCash/Easypaisa payments for orders
-        ├── services/       # __init__.py: create/verify/apply (locking, idempotency)
-        │                   # jazzcash.py, easypaisa.py: provider protocol only
-        └── webhooks/       # provider return URLs and IPN listeners
+    ├── payments/           # JazzCash/Easypaisa payments for orders
+    │   ├── services/       # __init__.py: create/verify/apply (locking, idempotency, status events)
+    │   │                   # jazzcash.py, easypaisa.py: provider protocol only
+    │   └── webhooks/       # provider return URLs and IPN listeners
+    ├── events/             # outbox -> Kafka -> workers (see "Background tasks")
+    │   ├── outbox.py       # enqueue() in the business transaction; audit() best effort
+    │   ├── publisher.py    # outbox_publisher: claim, produce, mark published on ack
+    │   ├── worker.py       # kafka_worker <group>: commit after durable work, retry/DLQ
+    │   ├── processing.py   # one task run: dedup, time limit, classification
+    │   ├── retry.py        # retry policy, error classification, sanitized errors
+    │   ├── registry.py     # consumer groups and @task registrations
+    │   ├── topics.py, envelope.py, kafka.py, inline.py, dlq.py, health.py, heartbeat.py
+    │   └── management/commands/   # kafka_create_topics, outbox_publisher, kafka_worker,
+    │                              # kafka_dlq, outbox, events_healthcheck
+    └── notifications/      # idempotent email delivery (Notification) and its tasks
 ```
+
+Each app's `tasks.py` registers its background tasks (`catalog/tasks.py`:
+image processing, `notifications/tasks.py`: emails, `events/tasks.py`:
+audit and DLQ archive).
 
 Dependency direction: `search → catalog`, `cart → catalog.selectors`, and
 everything → `authentication`/`common` for auth and responses. The catalog
@@ -126,7 +180,8 @@ doesn't import cart. Its flat `GET /api/products/` view calls
 ## API
 
 All paths are unchanged from the microservice version. Only the host
-changed: everything is now served on `:8000`.
+changed: everything is now served on `:8000` (the load balancer, or a
+single instance).
 
 | Prefix | Module | Notes |
 |--------|--------|-------|
@@ -136,8 +191,9 @@ changed: everything is now served on `:8000`.
 | `/api/products/`, `/api/categories/`, `/api/brands/`, `/api/banners/` | catalog (+search) | flat storefront/admin endpoints used by the React app |
 | `/api/cart/` | cart | user cart (`Bearer`), guest cart (`X-Guest-Session`), merge |
 | `/api/orders/` | orders | checkout options, place order from the cart, order detail |
-| `/api/health/` | common | Django + PostgreSQL (primary, replica) + Redis |
+| `/api/health/` | common | Django + PostgreSQL (primary, replica) + Redis + event pipeline summary; reports the answering `instance` |
 | `/api/health/database/` | common | Writer, reader pool and cluster: roles, replicas, lag, failover state, routing counters |
+| `/api/health/events/` | events | Outbox backlog, Kafka brokers/topics, consumer groups and lag, worker heartbeats, task latency, dead letters |
 | `/admin/` | Django admin | |
 
 Responses keep their existing envelopes. The auth and cart modules return
@@ -985,6 +1041,453 @@ self-managed clusters, run on one host for development.
 * **The reconciler is a script**, not an operator: it handles the scenarios
   above, not every edge case (e.g. a node whose disk is full).
 
+## L7 load balancer
+
+nginx (`nginx:1.30.5-alpine`, service `lb`) is an HTTP load balancer in
+front of the Django instances. It has nothing to do with the HAProxy in
+`docker-compose.ha.yml`, which is a TCP proxy for PostgreSQL (writer `:5000`,
+readers `:5001`); the two can run side by side.
+
+```
+client ──HTTP/HTTPS──► nginx :80 / :443 ──HTTP──► backend-1:8000  (Gunicorn, Django)
+                         │  least_conn           ► backend-2:8000
+                         │  /media/ served from the shared media volume
+```
+
+**Routing.** `BACKEND_UPSTREAMS` (`backend-1:8000,backend-2:8000`) lists the
+instances; `nginx/entrypoint.d/40-pixelforge-config.sh` renders them into
+the upstream block at container start. Requests go to the instance with the
+fewest active connections (`least_conn`). Server names are re-resolved
+through Docker's DNS every 10 s (`resolve`), so a restarted instance with a
+new IP is found again. The frontend is unchanged: it still calls
+`http://localhost:8000`.
+
+**Health and failure handling.** Open-source nginx has no active health
+checks, so unhealthy instances are detected passively, from real traffic:
+
+* a connection error, a timeout or a 502/503/504 counts as a failure and the
+  request is retried on the next instance (`proxy_next_upstream`, at most 3
+  tries within 15 s). POST/PUT/PATCH/DELETE are retried only when the
+  request never reached the first instance (connection refused/timeout), so
+  a checkout is never sent twice;
+* after `NGINX_MAX_FAILS` (3) failures within `NGINX_FAIL_TIMEOUT` (10 s) the
+  instance is skipped for 10 s, then tried again.
+
+Docker's own health check on every instance is `GET /api/health/` (503 only
+when the PostgreSQL primary is unreachable, 200 when degraded) and on nginx a
+local-only `/nginx-health`. For active checks in production, use nginx Plus
+(`health_check uri=/api/health/`), HAProxy/Envoy, or the cloud load
+balancer's target health checks on the same endpoint.
+
+| Setting (env on `lb`) | Default | |
+|-|-|-|
+| `BACKEND_UPSTREAMS` | `backend-1:8000,backend-2:8000` | instances, comma or space separated |
+| `NGINX_MAX_FAILS` / `NGINX_FAIL_TIMEOUT` | `3` / `10s` | passive health check |
+| `NGINX_PROXY_CONNECT_TIMEOUT` | `3s` | connect to an instance |
+| `NGINX_PROXY_READ_TIMEOUT` | `65s` | read/send timeout (Gunicorn's `--timeout` is 60 s) |
+| `NGINX_CLIENT_MAX_BODY_SIZE` | `25m` | uploads |
+| `NGINX_TLS_CERT` / `NGINX_TLS_KEY` | `/etc/nginx/certs/tls.crt` / `.key` | HTTPS on :443 (host `8443`) when both exist |
+| `NGINX_REDIRECT_HTTPS`, `NGINX_HSTS` | `false` | redirect HTTP to HTTPS; send HSTS |
+| `LB_HTTP_PORT`, `LB_HTTPS_PORT` | `8000`, `8443` | host ports (Compose) |
+
+**Forwarded headers and trust.** nginx sends the original `Host` (with port,
+so `build_absolute_uri` gives the right image URLs), `X-Forwarded-For`
+(client chain + peer), `X-Forwarded-Proto` (`http`/`https`), `X-Real-IP` and
+`X-Request-ID` (the client's if valid, else nginx's `$request_id`).
+Django believes them only from `TRUSTED_PROXIES` (IPs, CIDRs or hostnames;
+`lb` in Compose): `apps.common.proxy.TrustedProxyMiddleware`, first in
+`MIDDLEWARE`, sets `REMOTE_ADDR` to the nearest untrusted address of the
+`X-Forwarded-For` chain (read right to left) and keeps `X-Forwarded-Proto`
+for `SECURE_PROXY_SSL_HEADER`. From any other peer it deletes every
+forwarded header, so a client that reaches an instance directly can't fake
+its IP (rate limits) or claim HTTPS. DRF's throttling uses that
+`REMOTE_ADDR` (`NUM_PROXIES = 0`). With `TRUSTED_PROXIES` empty (runserver,
+the single-instance mode) nothing is trusted, as before.
+
+If another load balancer (e.g. a cloud ALB) terminates TLS in front of
+nginx, add its address range to `TRUSTED_PROXIES` and change
+`X-Forwarded-Proto $scheme` to `$http_x_forwarded_proto` in
+`nginx/templates/proxy.conf.template` (only when nginx is reachable from
+that load balancer alone).
+
+**TLS.** nginx terminates TLS (TLS 1.2/1.3, HTTP/2) when a certificate is
+mounted in `nginx/certs/` (see `nginx/certs/README.md` for a self-signed one);
+the instances get plain HTTP on the private `edge` network. In production
+also set `SECURE_SSL_REDIRECT=True`, `SESSION_COOKIE_SECURE=True`,
+`CSRF_COOKIE_SECURE=True`, `CSRF_TRUSTED_ORIGINS=https://your.domain`,
+`ALLOWED_HOSTS=your.domain`, `NGINX_REDIRECT_HTTPS=true` and `NGINX_HSTS=true`
+(or `SECURE_HSTS_SECONDS`).
+
+**Streaming and SSE.** The application doesn't stream today. Responses are
+buffered by nginx (a Gunicorn worker is freed as soon as the response is
+written); a streaming or SSE view opts out per response with the header
+`X-Accel-Buffering: no`, and needs a `location` with a longer
+`proxy_read_timeout` for long-lived streams.
+
+**Stateless instances, no sticky sessions.** Any instance can serve any
+request: Django sessions are in PostgreSQL, the cache and the
+read-your-writes markers in Redis (shared; with Redis down every read uses
+the primary), uploaded media on one volume shared by the instances, nginx
+and the image workers (object storage in production). In-process counters
+(cache and routing metrics in the health endpoints) are per instance; the
+health response names the answering `instance`.
+
+**Network exposure.** Only nginx publishes ports on all interfaces. The
+instances have no host ports; PostgreSQL (`5433`, `5434`) and Kafka's host
+listener (`9094`) are bound to `127.0.0.1`; Redis and Kafka's internal
+listener aren't published. nginx is only on the `edge` network and can't
+reach PostgreSQL, Redis or Kafka.
+
+**More instances:** add a `backend-3` service (copy `backend-2`, change
+`hostname`/`INSTANCE_NAME`) and set `BACKEND_UPSTREAMS=backend-1:8000,backend-2:8000,backend-3:8000`.
+
+**Checks.** `scripts/lb/check_lb.sh` validates the nginx config, checks that
+both instances serve requests, stops `backend-2` and requires every request
+(GET and POST) to succeed, restarts it and waits until it rejoins, and checks
+that no internal port is published publicly. `LB_TEST_URL=http://localhost:8000
+uv run manage.py test apps.common.tests_lb` checks distribution, identical
+responses, headers and that `/nginx-health` isn't public.
+
+## Background tasks (Kafka)
+
+### What runs in the background
+
+| Event | Written by (same transaction as) | Topic, key | Consumer groups → task |
+|-|-|-|-|
+| `order.placed` | checkout (`orders.services.place_order`) | `order-events`, order number | notifications → order email; audit |
+| `payment.succeeded` / `payment.failed` / `payment.refunded` | verified payment status change (`payments.services.apply_result`) | `payment-events`, order number | notifications → customer email, staff alert (refund needed / review); audit |
+| `inventory.low_stock` | a new `LowStockAlert` (`catalog.inventory`) | `inventory-events`, variant id | notifications → staff alert; audit |
+| `notification.password_reset_requested`, `notification.password_changed` | forgot/reset password views | `notification-events`, user id | notifications → email (the reset token is generated by the worker, never stored in the event) |
+| `image.uploaded` | admin image upload | `image-processing`, file path | images → WebP variants (320/800/1600 px, no EXIF/GPS) in `ProcessedImage` |
+| `audit.login_succeeded`, `audit.login_failed`, `audit.product_*` | best effort, after commit (no outbox) | `audit-events`, aggregate id | audit → `AuditEvent` |
+
+**Not moved:** checkout, stock reservation (`InventoryManager`), payment
+signature checks, provider inquiries and payment/order state transitions
+stay synchronous, inside their transactions, exactly as before. The events
+are written *by* those transactions; the work they trigger is optional
+follow-up (emails, images, audit). A request returns as soon as its
+transaction (with its outbox rows) has committed.
+
+Event payloads carry identifiers and non-sensitive facts (order number,
+status, amount); workers load everything else from PostgreSQL. No
+credentials, tokens, provider responses, transaction references, addresses
+or card data are put in events.
+
+### Kafka client and broker
+
+* **Client: [confluent-kafka](https://github.com/confluentinc/confluent-kafka-python) 2.15.1**
+  (librdkafka 2.15). Maintained by Confluent, ships manylinux wheels (no
+  compiler in the image), supports the idempotent producer, `acks=all`,
+  manual offset commits, pause/resume/seek (used for retry scheduling) and
+  the Admin API (topic creation, consumer-group offsets for lag). kafka-python
+  has no idempotent producer and aiokafka is asyncio-only.
+* **Broker: `apache/kafka:4.3.1`** in KRaft mode (no ZooKeeper; Kafka 4 is
+  KRaft-only), one combined broker/controller locally. Topics are created
+  only by `kafka_create_topics` (`auto.create.topics.enable=false`).
+* No Celery: each consumer group is a plain management command
+  (`kafka_worker <group>`) that owns its Kafka consumer.
+
+### Transactional outbox
+
+The failure this prevents: Django commits an order, then crashes before
+publishing its Kafka message; the order exists but its email is never sent.
+
+```
+request ── BEGIN ─ INSERT order … ─ INSERT apps_outbox_event (pending) ─ COMMIT ──► response
+                                                   │
+outbox_publisher (separate process) ───────────────┘
+  1. claim due pending rows: SELECT … FOR UPDATE SKIP LOCKED + lease (locked_until), COMMIT
+  2. produce each row (idempotent producer, acks=all), flush
+  3. delivery callback OK  → status=published, published_at, partition/offset
+     error / no ack       → attempts+1, available_at = now + backoff (1s, 2s, … 60s), stays pending
+     permanent error      → status=failed (message too large, not authorised) for an operator
+```
+
+* The order and its outbox row commit or roll back together: a rolled-back
+  checkout has no event, a committed one always has one.
+* **Publishing is not atomic with the commit.** It happens later, at least
+  once. If the publisher dies after Kafka acknowledged a row but before
+  marking it, the row is published again: consumers deduplicate on the
+  `event_id`. Kafka producer idempotence only removes duplicates from the
+  producer's own internal retries.
+* No transaction is held open while talking to Kafka. Several publishers can
+  run (`SKIP LOCKED`); a dead publisher's claims expire after
+  `OUTBOX_LEASE_SECONDS` and are taken over, so nothing pending is lost
+  across restarts.
+* While Kafka is down, requests keep succeeding (`/api/health/` reports
+  `degraded`), rows accumulate, and they are published when the broker is
+  back (tested: three password-reset events written during a broker outage
+  were published within 8 s of its restart, one email each).
+* **Best-effort events:** audit records of logins and admin edits use
+  `outbox.audit()`, which skips the outbox: after the commit they are handed
+  to an in-memory Kafka producer and are lost if Kafka is down or the
+  instance dies first (counted as `audit_dropped_total`). Only for records
+  nobody acts on.
+* Rows: `OutboxEvent` (`apps_outbox_event`): `id` (message id), `event_id`,
+  `kind` (`event`, or `forward` for a worker's retry/DLQ message), `event_type`,
+  `topic`, `key`, `aggregate_type`, `aggregate_id`, `payload` (the exact
+  message), `headers`, `status`, `attempts`, `available_at`, `locked_until`,
+  `last_error`, `created_at`, `published_at`, `kafka_partition`/`offset`.
+  `manage.py outbox cleanup` deletes published rows after
+  `OUTBOX_RETENTION_DAYS` (run it daily).
+
+### Topics and partitions
+
+| Topic | Partitions (dev) | Retention | Key |
+|-|-|-|-|
+| `order-events`, `payment-events` | 3 | 7 days | order number |
+| `inventory-events` | 3 | 7 days | variant id |
+| `notification-events` | 3 | 7 days | user id |
+| `image-processing` | 3 | 7 days | file path |
+| `audit-events` | 3 | 7 days | aggregate id |
+| `retry-events` | 3 | 7 days | the original key |
+| `dead-letter-events` | 1 | 30 days | the original key |
+
+One topic per stream, not per task or entity. The key keeps one order's
+events in one partition, in order; **Kafka orders messages only within a
+partition**, never across partitions or topics, and a retried event leaves
+its partition (later events for the same key can be processed first), so
+tasks load the current state from PostgreSQL instead of relying on order.
+Names can be namespaced with `KAFKA_TOPIC_PREFIX` or overridden per topic
+(`KAFKA_TOPIC_ORDER_EVENTS=…`).
+
+Production tuning: replication factor 3 and `min.insync.replicas=2`
+(`KAFKA_TOPIC_REPLICATION_FACTOR`, `KAFKA_TOPIC_MIN_INSYNC_REPLICAS`) on at
+least 3 brokers; partitions = the most workers of one group you want working
+in parallel (6–12 for orders/payments is plenty here; partitions can be
+added later, which remaps keys, but never removed); retention longer than
+the longest outage you want to recover from without replays (and shorter
+than `EVENTS_PROCESSED_RETENTION_DAYS`); a longer DLQ retention.
+
+### Consumer groups
+
+| Group (`kafka_worker <name>`) | Kafka group id | Topics | Compose |
+|-|-|-|-|
+| `notifications` | `pixelforge-notifications` | order, payment, inventory, notification events + `retry-events` | `worker-notifications` × `NOTIFICATION_WORKERS` (2) |
+| `images` | `pixelforge-images` | `image-processing` + `retry-events` | `worker-images` |
+| `audit` | `pixelforge-audit` | order, payment, inventory, audit events + `retry-events` | `worker-audit` |
+| `dlq-archiver` | `pixelforge-dlq-archiver` | `dead-letter-events` | `worker-dlq` |
+
+Every group receives every message of its topics (the notifications and
+audit groups both see each `order.placed`); inside a group Kafka gives each
+partition to one worker, so workers of a group share the load (at most one
+busy worker per partition; extras stand by and take over on failure). A
+worker that stops (or doesn't poll for `KAFKA_MAX_POLL_INTERVAL_MS`) leaves
+the group and its partitions move to the others, from the last committed
+offset.
+
+### Retries and backoff
+
+A task fails → it is classified and either retried, or dead-lettered:
+
+| Class | Examples | Outcome |
+|-|-|-|
+| retryable | `RetryableError`, `TaskTimeout`, connection/timeout errors, `OperationalError`, SMTP disconnects, `TaskInProgress` | retry, until `max_attempts` |
+| non-retryable | `NonRetryableError`, invalid message, missing object, refused recipient, `KeyError`/`TypeError`/`ValueError` | dead letter at once |
+| unknown | anything else | retried while `EVENTS_RETRY_UNKNOWN_ERRORS` (default) |
+
+Extra classes come from `EVENTS_RETRYABLE_EXCEPTIONS` /
+`EVENTS_NON_RETRYABLE_EXCEPTIONS` (dotted paths). Delay after attempt *n*:
+`min(max_delay, base × multiplier^(n-1))` ± `jitter` (a fraction, so retries
+of many messages that failed together are spread out), capped at
+`max_delay`. Defaults: 5 attempts in total, 1 s base, ×2, ±20 %, 300 s max,
+so about 1 s, 2 s, 4 s, 8 s and then the DLQ. A task may run at most
+`EVENTS_TASK_TIMEOUT` (60 s; image processing 120 s) before it is
+interrupted and retried (`KAFKA_MAX_POLL_INTERVAL_MS` must exceed it).
+Tasks can override the policy: `@task("images", "image.uploaded", timeout=120)`.
+
+**Delayed delivery without sleeping.** A retry is a message on
+`retry-events` with `failure.next_retry_at`, `failure.attempt` and
+`failure.target_group`. Each group also consumes `retry-events`; messages for
+other groups are skipped. A retry that isn't due yet is not slept on: the
+worker pauses that partition, rewinds it to the message and resumes it when
+it's due, while its other partitions keep flowing. The offset is committed
+only after the retry runs. Limitation: a not-yet-due retry holds back the
+retries behind it in the same partition (at most `EVENTS_RETRY_MAX_DELAY`).
+
+A retry message keeps the original event untouched and adds `failure`:
+`target_group`, `consumer_group`, `task`, `event_type`, `entity_id`,
+`attempt`, `max_attempts`, `original_topic`/`partition`/`offset` (of the first
+delivery), `error_category` (`transient`, `timeout`, `permanent`,
+`invalid_message`, `unknown`), `error_type`, `error_message` (sanitized: no
+emails, credentials, URLs with passwords or long tokens), `first_failed_at`,
+`last_failed_at`, `next_retry_at`, `correlation_id` (the request id) and
+`replay_count`.
+
+**The original message is acknowledged only after its retry or dead letter
+is durable.** The worker produces it and waits for Kafka's acknowledgement;
+if Kafka can't take it, the message is written to the outbox
+(`kind=forward`) and published later by the publisher; if PostgreSQL is
+down as well, nothing is committed: the partition is rewound and paused with
+a backoff (`EVENTS_FORWARD_BACKOFF`, up to 60 s) and the message is processed
+again. A failed task is never dropped.
+
+### Dead letters and replay
+
+After the last attempt (or at once for non-retryable errors and malformed
+messages) the message goes to `dead-letter-events` with
+`failure.reason` (`retries_exhausted`, `non_retryable`, `invalid_message`)
+and `dead_lettered_at`. The `dlq-archiver` group stores each one in
+`DeadLetterEvent` (one row per group and event; the topic keeps the raw
+messages for 30 days). Nothing is replayed automatically; replay is an
+operator action after fixing the cause:
+
+```bash
+docker compose exec backend-1 python manage.py kafka_dlq list                    # pending dead letters
+docker compose exec backend-1 python manage.py kafka_dlq show 12                 # full message
+docker compose exec backend-1 python manage.py kafka_dlq replay 12 13 --note "SMTP fixed"
+docker compose exec backend-1 python manage.py kafka_dlq replay --group notifications --all --limit 20
+docker compose exec backend-1 python manage.py kafka_dlq discard 14 --note "order cancelled"
+```
+
+A replay writes a retry message (attempts start again, `replay_count` + 1,
+only for the failed group) to the outbox in the same transaction that marks
+the row `replayed`. One command replays at most 100 rows, and an event can
+be replayed at most `EVENTS_MAX_DLQ_REPLAYS` (3) times, so a poison message
+can't loop. If it fails again it comes back as `pending`. Pending dead
+letters make `/api/health/events/` report `degraded`.
+
+### Idempotency
+
+Delivery is **at least once**; duplicates come from publisher restarts,
+consumer rebalances, redeliveries after a crash and replays. Business
+effects are made idempotent, not "exactly once":
+
+1. `ProcessedEvent (consumer_group, event_id)` (unique) is written after a
+   task succeeds and before its offset is committed. A redelivered event
+   whose record exists is acknowledged without running the task. A crash
+   between the database commit and the Kafka commit therefore only causes a
+   skipped redelivery.
+2. Each task's effect has its own unique key: `Notification.dedup_key`
+   (kind + event id + recipient), `AuditEvent.event_id`,
+   `ProcessedImage.source_path`, `DeadLetterEvent (group, event_id)`. This
+   covers a crash after the effect but before step 1's record.
+3. Emails are claimed before sending (`status=sending` with a lease): two
+   workers handling the same event at once can't both send; the second gets
+   `TaskInProgress` and retries.
+
+**Limits.** If a worker dies after the SMTP server accepted an email but
+before marking it sent, the email is sent again once the claim expires
+(SMTP has no idempotency key). Ordering per key is best effort (see
+[Topics](#topics-and-partitions)). The DLQ archiver deduplicates on the
+message id (an event can be dead-lettered again after a replay).
+`ProcessedEvent` rows are kept `EVENTS_PROCESSED_RETENTION_DAYS` (14), longer
+than topic retention (`manage.py outbox cleanup` removes older ones).
+
+### Payment events
+
+The JazzCash/Easypaisa flow is unchanged: signatures are checked and the
+provider's inquiry API is the authority, inside the same locked
+transactions. A redirect alone never marks a payment paid. When a verified
+result changes the payment's status, `apply_result` writes
+`payment.succeeded`/`failed`/`refunded` to the outbox in that transaction,
+so the event exists exactly when the change committed; an unverified PAID
+is refused and logged. Duplicate callbacks and IPN retries don't change the
+status again and so write no second event; a duplicate Kafka delivery is
+deduplicated by the consumers. Payloads: payment id, order number, user id,
+method, status, previous status, amount, currency, order status and the
+`needs_refund`/`needs_review` flags.
+
+### Inline mode (no Kafka)
+
+Without `KAFKA_BOOTSTRAP_SERVERS` (`EVENTS_BACKEND=inline`: local runserver,
+`docker compose up backend`, `docker-compose.ha.yml`, the test suite) the
+same outbox rows are written and processed in-process right after the
+commit by the same tasks, so emails still go out. A failed task leaves its
+row pending with a backoff; `manage.py outbox_publisher` (which also works in
+inline mode) retries it. Inline mode has no retry topic or DLQ.
+
+### Observability
+
+* **`GET /api/health/events/`** (public, counts only): `outbox` (pending,
+  pending forwards, retrying, failed, `oldest_pending_age_seconds`),
+  `kafka` (brokers, missing topics, DLQ topic size, per consumer group: state,
+  members, lag in total and per topic), `workers` (per process role: live and
+  stale members, partition assignments, summed counters, per-task count,
+  failures, failure rate, average and max latency), `dead_letters` (pending
+  per group), and `problems` (why it's `degraded`). Always 200: a degraded
+  pipeline doesn't take an instance out of the load balancer. The Kafka part
+  is cached `EVENTS_HEALTH_CACHE_SECONDS` per instance.
+* **`GET /api/health/`** has a compact `checks.events` (backend, outbox,
+  Kafka reachability) and turns `degraded` when Kafka is unreachable or the
+  outbox backlog is older than `EVENTS_OUTBOX_MAX_AGE`.
+* **Heartbeats:** workers and the publisher update `ConsumerHeartbeat` every
+  `EVENTS_HEARTBEAT_INTERVAL` with their counters; the Compose health checks
+  run `manage.py events_healthcheck`.
+* **Counters** (per process, Prometheus-style names): `outbox_published_total`,
+  `outbox_publish_failures_total`, `events_processed_total`,
+  `events_duplicates_total`, `events_failed_total`, `events_retried_total`,
+  `events_dead_lettered_total`, `events_timeouts_total`,
+  `events_forward_fallbacks_total`, `events_forward_blocked_total`,
+  `audit_dropped_total`, ….
+* **Logs:** structured `event=<name> key=value` lines on `apps.events`
+  (`outbox_published`, `event_processed`, `event_failed`,
+  `event_retry_scheduled`, `event_dead_lettered`, `partition_blocked`,
+  `partitions_assigned`, …) with ids, attempts, durations, sanitized errors
+  and the `correlation_id`, never payloads. `LOG_FORMAT=json` prints one JSON
+  object per line. The request id travels from nginx (`X-Request-ID`) into
+  the event and every worker log line about it.
+
+### Operations and troubleshooting
+
+| Symptom | Check | Fix |
+|-|-|-|
+| `outbox backlog` in health | `manage.py outbox status`; `docker compose logs outbox-publisher` | Kafka down: it drains by itself when the broker is back. Publisher down: `docker compose up -d outbox-publisher` |
+| `N outbox row(s) failed permanently` | `last_error` in the admin (Events → Outbox events) | fix the cause, then `manage.py outbox requeue --all-failed` |
+| `<group>: no live worker` | `docker compose ps`, `logs worker-<group>` | restart the worker; check `KAFKA_BOOTSTRAP_SERVERS` |
+| consumer lag grows | `/api/health/events/` lag per topic; task latency | scale the group (`NOTIFICATION_WORKERS=3`, up to the partition count) or fix a slow dependency |
+| `partition_blocked` logs | Kafka and PostgreSQL reachability from the worker | recovers by itself; messages are redelivered |
+| dead letters pending | `manage.py kafka_dlq list` / `show` | fix, then `kafka_dlq replay`, or `discard` |
+| `missing topics` | `docker compose logs kafka-init` | `docker compose run --rm kafka-init` |
+| a worker runs a task twice in its logs | `event_duplicate` lines | expected after rebalances; effects are deduplicated |
+
+### Testing the pipeline
+
+* Unit tests (no broker): retry policy and classification, sanitizing,
+  time limits, outbox commit/rollback, inline mode, the publisher with a fake
+  producer (acknowledgement, transient and permanent failures, leases), the
+  worker with fake clients (commit after success, duplicates, retry metadata
+  and backoff, exhaustion → DLQ, non-retryable → DLQ, deferred retries pause
+  instead of sleeping, Kafka down → outbox fallback, Kafka and PostgreSQL down
+  → no commit, invalid messages), DLQ archive/replay limits, notifications
+  (dedup, claims), order/payment/low-stock/password/image events, proxy trust
+  and health. They run in the normal suite.
+* Integration tests with the real broker (`apps/events/tests/test_kafka_integration.py`,
+  own topics per test): outbox → publisher → worker; duplicate delivery;
+  retry topic backoff then success; exhaustion → DLQ → archive → replay;
+  worker crash after the database commit (redelivery deduplicated); crash
+  before processing (redelivered and processed); partitions shared by two
+  workers of a group; publisher recovery after Kafka was unreachable; DLQ
+  publish failure → outbox → delivered later; verified payment → email.
+
+```bash
+docker compose up -d kafka                                    # broker on 127.0.0.1:9094
+uv run manage.py test apps.events.tests.test_kafka_integration
+```
+
+### Production recommendations
+
+* **Kafka:** 3+ brokers (or a managed service: MSK, Confluent Cloud, Aiven),
+  replication factor 3, `min.insync.replicas=2`, `SASL_SSL` with SCRAM or mTLS
+  (`KAFKA_SECURITY_PROTOCOL`, `KAFKA_SASL_*`, `KAFKA_SSL_CA_LOCATION`), ACLs:
+  the web instances may only write the outbox (they don't talk to Kafka
+  except best-effort audit events), the publisher may write the topics, each
+  worker may read its topics, commit its group and write
+  `retry-events`/`dead-letter-events`. Never publish the broker port.
+* **Workers:** scale each group independently, up to its partition count;
+  give them `stop_grace_period` > `EVENTS_TASK_TIMEOUT`. Run one publisher
+  (or two for availability, accepting best-effort ordering per key).
+* **Database:** schedule `manage.py outbox cleanup` daily; watch the outbox
+  backlog age, consumer lag, DLQ size and task failure rates (alert on
+  `problems` in `/api/health/events/`).
+* **Email:** a transactional email provider; its API's idempotency key (if
+  any) can close the SMTP duplicate window described above.
+* **Media:** object storage (S3, GCS) instead of a shared volume, so web
+  instances and image workers can run on different hosts.
+* **Load balancer:** two nginx instances (or a cloud load balancer) with
+  active health checks on `/api/health/`, TLS certificates from your CA/ACME,
+  request rate limits, and `TRUSTED_PROXIES` set to their exact addresses.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -1019,6 +1522,36 @@ self-managed clusters, run on one host for development.
 | `EMAIL_*`, `DEFAULT_FROM_EMAIL` | console backend | Outgoing email |
 | `PAYMENT_*`, `JAZZCASH_*`, `EASYPAISA_*` | empty | Online payments; see below |
 | `REDIS_URL`, `CACHE_*`, `NEGATIVE_CACHE_*` | see [Cache configuration](#cache-configuration) | Redis cache |
+| `INSTANCE_NAME` | host name | Instance name in `/api/health/` (several run behind the load balancer) |
+| `TRUSTED_PROXIES` | empty | IPs, CIDRs or hostnames whose `X-Forwarded-*` headers are believed (`lb` in Compose); enables `SECURE_PROXY_SSL_HEADER` |
+| `TRUSTED_PROXY_DNS_TTL` | `30` | Seconds a resolved proxy hostname is cached |
+| `SECURE_SSL_REDIRECT`, `SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE`, `SECURE_HSTS_SECONDS` | `False`/`0` | HTTPS hardening behind the TLS-terminating proxy |
+| `CSRF_TRUSTED_ORIGINS` | empty | e.g. `https://shop.example` for the admin over HTTPS |
+| `LOG_FORMAT` | `verbose` | `json`: one JSON object per log line |
+| `EMAIL_TIMEOUT` | `10` | SMTP timeout (seconds) in the workers |
+| `ALERT_ROLES`, `ALERT_EMAILS` | `admin,inventory_manager` / empty | Recipients of staff alerts (low stock, refunds, payments to review) |
+| `KAFKA_BOOTSTRAP_SERVERS` | empty | Brokers (`kafka:9092` in Compose). Empty = inline mode |
+| `EVENTS_BACKEND` | `kafka` if brokers are set, else `inline` | See [Inline mode](#inline-mode-no-kafka) |
+| `KAFKA_SECURITY_PROTOCOL`, `KAFKA_SASL_MECHANISM`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD`, `KAFKA_SSL_CA_LOCATION` | `PLAINTEXT` / empty | Broker security (production: `SASL_SSL`) |
+| `KAFKA_CLIENT_ID`, `KAFKA_CONSUMER_GROUP_PREFIX` | `pixelforge` | Client id prefix; group ids are `<prefix>-<group>` |
+| `KAFKA_TOPIC_PREFIX`, `KAFKA_TOPIC_<NAME>` | empty / the logical name | Topic namespacing and per-topic names (e.g. `KAFKA_TOPIC_ORDER_EVENTS`) |
+| `KAFKA_TOPIC_PARTITIONS`, `KAFKA_TOPIC_REPLICATION_FACTOR`, `KAFKA_TOPIC_MIN_INSYNC_REPLICAS` | `3`, `1`, `1` | Used by `kafka_create_topics` |
+| `KAFKA_TOPIC_RETENTION_HOURS`, `KAFKA_DLQ_RETENTION_HOURS` | `168`, `720` | Topic retention |
+| `KAFKA_DELIVERY_TIMEOUT_MS`, `KAFKA_ADMIN_TIMEOUT` | `30000`, `3` | Producer delivery bound; admin/health call timeout (seconds) |
+| `KAFKA_MAX_POLL_INTERVAL_MS`, `KAFKA_SESSION_TIMEOUT_MS` | `300000`, `45000` | Consumer liveness (must exceed the task timeout) |
+| `OUTBOX_BATCH_SIZE`, `OUTBOX_POLL_INTERVAL`, `OUTBOX_LEASE_SECONDS` | `100`, `1.0`, `60` | Publisher batch, idle poll, claim lease |
+| `OUTBOX_RETRY_BASE_DELAY`, `OUTBOX_RETRY_MAX_DELAY` | `1`, `60` | Publisher backoff after a failed publish |
+| `OUTBOX_RETENTION_DAYS`, `EVENTS_PROCESSED_RETENTION_DAYS` | `7`, `14` | `outbox cleanup`: published rows, idempotency records |
+| `EVENTS_RETRY_MAX_ATTEMPTS`, `EVENTS_RETRY_BASE_DELAY`, `EVENTS_RETRY_MULTIPLIER`, `EVENTS_RETRY_MAX_DELAY`, `EVENTS_RETRY_JITTER` | `5`, `1`, `2`, `300`, `0.2` | Task retry policy |
+| `EVENTS_RETRYABLE_EXCEPTIONS`, `EVENTS_NON_RETRYABLE_EXCEPTIONS`, `EVENTS_RETRY_UNKNOWN_ERRORS` | empty, empty, `True` | Error classification |
+| `EVENTS_TASK_TIMEOUT` | `60` | Seconds a task may run |
+| `EVENTS_FORWARD_BACKOFF`, `EVENTS_FORWARD_BACKOFF_MAX` | `5`, `60` | Backoff when a failure can be recorded neither in Kafka nor PostgreSQL |
+| `EVENTS_MAX_DLQ_REPLAYS` | `3` | Replays per dead letter |
+| `EVENTS_INLINE_DISPATCH` | `True` | Inline mode: process rows right after commit |
+| `EVENTS_HEARTBEAT_INTERVAL`, `EVENTS_HEARTBEAT_STALE_AFTER` | `10`, `60` | Worker/publisher heartbeats |
+| `EVENTS_HEALTH_CACHE_SECONDS`, `EVENTS_OUTBOX_MAX_AGE`, `EVENTS_MAX_CONSUMER_LAG` | `10`, `60`, `1000` | Health caching and thresholds |
+| `BACKEND_UPSTREAMS`, `NGINX_*`, `LB_HTTP_PORT`, `LB_HTTPS_PORT` | see [L7 load balancer](#l7-load-balancer) | Load balancer (env of the `lb` service) |
+| `NOTIFICATION_WORKERS`, `GUNICORN_WORKERS` | `2`, `3` | Compose: notification workers, Gunicorn workers per instance |
 
 ## Online payments (JazzCash and Easypaisa)
 
@@ -1041,7 +1574,9 @@ self-managed clusters, run on one host for development.
    * Easypaisa: the redirect isn't signed, so the status and amount always
      come from the **inquire-transaction API**.
 5. A verified PAID result sets the payment to `PAID` and the order to
-   `confirmed` (once). The browser lands on
+   `confirmed` (once), and writes `payment.succeeded` to the outbox in the
+   same transaction (the confirmation email is sent by a worker; see
+   [Payment events](#payment-events)). The browser lands on
    `PAYMENT_RESULT_URL?payment_id=…`, and React polls
    `GET /api/payments/<payment_id>/` until the status is final.
 
@@ -1137,6 +1672,12 @@ domain.
 | `cleanup_guest_carts` | Delete expired guest carts |
 | `setup_rbac` | Django groups/permissions mirroring the roles |
 | `test_db_connection` | Check database connectivity |
+| `kafka_create_topics [--wait S] [--dry-run]` | Create the Kafka topics (idempotent) |
+| `outbox_publisher [--once]` | Publish the outbox to Kafka (inline mode: process it in-process) |
+| `kafka_worker <group>` | Consumer worker: `notifications`, `images`, `audit`, `dlq-archiver` |
+| `kafka_dlq list\|show\|replay\|discard` | Dead letters (see [Dead letters and replay](#dead-letters-and-replay)) |
+| `outbox status\|requeue\|cleanup` | Outbox backlog, requeue failed rows, delete old published rows and idempotency records |
+| `events_healthcheck worker\|outbox-publisher` | Container health check (fresh heartbeat on this host) |
 
 ## Migrating data from the old per-service databases
 
@@ -1153,6 +1694,7 @@ scripts/merge_legacy_databases.sh
 
 The script only reads the source databases, refuses to write into
 non-empty target tables, resets sequences and rebuilds search stats.
-Outbox events aren't copied, because the outbox was removed. Django
+The old services' outbox tables aren't copied (the current outbox,
+`apps_outbox_event`, starts empty). Django
 groups/permissions aren't copied either, since their content-type ids
 differ per database; re-run `setup_rbac`.

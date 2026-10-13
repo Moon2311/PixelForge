@@ -1,9 +1,12 @@
 """Django settings for the PixelForge modular monolith.
 
 One Django project serves every module (authentication, catalog, search,
-cart) from a single process and a single PostgreSQL database.
+cart, orders, payments) from one PostgreSQL primary. Several identical
+instances can run behind the L7 load balancer; background work goes through
+the transactional outbox to Kafka workers (apps.events).
 """
 
+import socket
 from pathlib import Path
 
 import environ
@@ -20,8 +23,35 @@ SECRET_KEY = env.str(
     "SECRET_KEY",
     default="django-insecure-dev-only-change-me-jtw7@j7(&j(jjr&^7-$88w_+&g%_61*x*taw",
 )
-DEBUG = env.bool("DEBUG", default=True)
+DEBUG = env.bool("DEBUG", default=False)
 ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=["*"])
+
+# Name of this application instance (shown by /api/health/; several run
+# behind the load balancer). Defaults to the container/host name.
+INSTANCE_NAME = env.str("INSTANCE_NAME", default="") or socket.gethostname()
+
+
+# ---------------------------------------------------------------------------
+# Reverse proxy / load balancer. See README "L7 load balancer".
+#
+# X-Forwarded-For/-Proto/-Host are believed only from TRUSTED_PROXIES (IPs,
+# CIDRs or hostnames, e.g. "lb" in Docker Compose); from anyone else they are
+# removed before Django sees them. Empty (the default, e.g. runserver) trusts
+# no one: REMOTE_ADDR and the request scheme are used as they are.
+# ---------------------------------------------------------------------------
+
+TRUSTED_PROXIES = env.list("TRUSTED_PROXIES", default=[])
+# Seconds a resolved proxy hostname is cached (containers can change IP).
+TRUSTED_PROXY_DNS_TTL = env.int("TRUSTED_PROXY_DNS_TTL", default=30)
+# HTTPS detection behind the TLS-terminating proxy. Safe because the header
+# is stripped from untrusted clients (apps.common.proxy).
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https") if TRUSTED_PROXIES else None
+USE_X_FORWARDED_HOST = False  # the proxy passes the original Host header itself
+SECURE_SSL_REDIRECT = env.bool("SECURE_SSL_REDIRECT", default=False)
+SESSION_COOKIE_SECURE = env.bool("SESSION_COOKIE_SECURE", default=False)
+CSRF_COOKIE_SECURE = env.bool("CSRF_COOKIE_SECURE", default=False)
+CSRF_TRUSTED_ORIGINS = env.list("CSRF_TRUSTED_ORIGINS", default=[])
+SECURE_HSTS_SECONDS = env.int("SECURE_HSTS_SECONDS", default=0)
 
 
 # ---------------------------------------------------------------------------
@@ -46,9 +76,15 @@ INSTALLED_APPS = [
     "apps.cart",
     "apps.orders",
     "apps.payments",
+    "apps.events",
+    "apps.notifications",
 ]
 
 MIDDLEWARE = [
+    # First: everything below sees the real client address and scheme, and
+    # forwarded headers from anyone but a trusted proxy are dropped.
+    "apps.common.proxy.TrustedProxyMiddleware",
+    "apps.common.proxy.RequestIDMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     # Read routing (primary/replica); before sessions/auth so their writes are seen.
@@ -343,6 +379,119 @@ EMAIL_HOST_USER = env.str("EMAIL_HOST_USER", default="")
 EMAIL_HOST_PASSWORD = env.str("EMAIL_HOST_PASSWORD", default="")
 EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=True)
 DEFAULT_FROM_EMAIL = env.str("DEFAULT_FROM_EMAIL", default="PixelForge <no-reply@pixelforge.com>")
+# Seconds an SMTP connection may block (emails are sent by background workers).
+EMAIL_TIMEOUT = env.int("EMAIL_TIMEOUT", default=10)
+# Who receives operational alerts (low stock, payments needing a refund):
+# users holding these roles, plus these addresses.
+ALERT_ROLES = env.list("ALERT_ROLES", default=["admin", "inventory_manager"])
+ALERT_EMAILS = env.list("ALERT_EMAILS", default=[])
+
+
+# ---------------------------------------------------------------------------
+# Asynchronous events (apps.events): transactional outbox -> Kafka -> workers.
+# See README "Background tasks (Kafka)". Never log these settings (SASL
+# passwords).
+#
+# EVENTS_BACKEND
+#   "kafka"   business transactions write outbox rows; `outbox_publisher`
+#             publishes them to Kafka and `kafka_worker <group>` processes them.
+#   "inline"  no Kafka (the default when KAFKA_BOOTSTRAP_SERVERS is unset): the
+#             same outbox rows are processed in-process right after the
+#             transaction commits, as before Kafka (single-backend development).
+# ---------------------------------------------------------------------------
+
+KAFKA_BOOTSTRAP_SERVERS = env.str("KAFKA_BOOTSTRAP_SERVERS", default="")
+EVENTS_BACKEND = env.str("EVENTS_BACKEND", default="kafka" if KAFKA_BOOTSTRAP_SERVERS else "inline")
+if EVENTS_BACKEND not in ("kafka", "inline"):
+    raise ImproperlyConfigured("EVENTS_BACKEND must be 'kafka' or 'inline'")
+if EVENTS_BACKEND == "kafka" and not KAFKA_BOOTSTRAP_SERVERS:
+    raise ImproperlyConfigured("EVENTS_BACKEND=kafka needs KAFKA_BOOTSTRAP_SERVERS")
+KAFKA_CLIENT_ID = env.str("KAFKA_CLIENT_ID", default="pixelforge")
+# PLAINTEXT (local Docker network), SSL, SASL_SSL (production).
+KAFKA_SECURITY_PROTOCOL = env.str("KAFKA_SECURITY_PROTOCOL", default="PLAINTEXT")
+KAFKA_SASL_MECHANISM = env.str("KAFKA_SASL_MECHANISM", default="")
+KAFKA_SASL_USERNAME = env.str("KAFKA_SASL_USERNAME", default="")
+KAFKA_SASL_PASSWORD = env.str("KAFKA_SASL_PASSWORD", default="")
+KAFKA_SSL_CA_LOCATION = env.str("KAFKA_SSL_CA_LOCATION", default="")
+# Seconds an admin/metadata call (health checks, topic creation) may take.
+KAFKA_ADMIN_TIMEOUT = env.float("KAFKA_ADMIN_TIMEOUT", default=3.0)
+# Producer: acks=all + idempotence are always on; this bounds one delivery.
+KAFKA_DELIVERY_TIMEOUT_MS = env.int("KAFKA_DELIVERY_TIMEOUT_MS", default=30000)
+# Consumers: a worker that doesn't poll for this long leaves its group.
+# Must exceed EVENTS_TASK_TIMEOUT.
+KAFKA_MAX_POLL_INTERVAL_MS = env.int("KAFKA_MAX_POLL_INTERVAL_MS", default=300000)
+KAFKA_SESSION_TIMEOUT_MS = env.int("KAFKA_SESSION_TIMEOUT_MS", default=45000)
+# Consumer group ids are "<prefix>-<group>", e.g. pixelforge-notifications.
+KAFKA_CONSUMER_GROUP_PREFIX = env.str("KAFKA_CONSUMER_GROUP_PREFIX", default="pixelforge")
+
+# Topic names (logical name -> Kafka topic). KAFKA_TOPIC_PREFIX namespaces
+# every topic (e.g. "staging.") on a shared cluster.
+KAFKA_TOPIC_PREFIX = env.str("KAFKA_TOPIC_PREFIX", default="")
+KAFKA_TOPICS = {
+    name: KAFKA_TOPIC_PREFIX + env.str(f"KAFKA_TOPIC_{name.upper().replace('-', '_')}", default=name)
+    for name in (
+        "order-events",
+        "payment-events",
+        "inventory-events",
+        "notification-events",
+        "image-processing",
+        "audit-events",
+        "retry-events",
+        "dead-letter-events",
+    )
+}
+# Topic creation (`manage.py kafka_create_topics`). One broker locally;
+# production: 3 brokers, replication factor 3, min.insync.replicas 2.
+KAFKA_TOPIC_PARTITIONS = env.int("KAFKA_TOPIC_PARTITIONS", default=3)
+KAFKA_TOPIC_REPLICATION_FACTOR = env.int("KAFKA_TOPIC_REPLICATION_FACTOR", default=1)
+KAFKA_TOPIC_MIN_INSYNC_REPLICAS = env.int("KAFKA_TOPIC_MIN_INSYNC_REPLICAS", default=1)
+KAFKA_TOPIC_RETENTION_HOURS = env.int("KAFKA_TOPIC_RETENTION_HOURS", default=24 * 7)
+KAFKA_DLQ_RETENTION_HOURS = env.int("KAFKA_DLQ_RETENTION_HOURS", default=24 * 30)
+
+# Outbox publisher.
+OUTBOX_BATCH_SIZE = env.int("OUTBOX_BATCH_SIZE", default=100)
+OUTBOX_POLL_INTERVAL = env.float("OUTBOX_POLL_INTERVAL", default=1.0)
+# A claimed row is retried by another publisher once its lease runs out.
+OUTBOX_LEASE_SECONDS = env.int("OUTBOX_LEASE_SECONDS", default=60)
+OUTBOX_RETRY_BASE_DELAY = env.float("OUTBOX_RETRY_BASE_DELAY", default=1.0)
+OUTBOX_RETRY_MAX_DELAY = env.float("OUTBOX_RETRY_MAX_DELAY", default=60.0)
+# Published rows older than this are removed by `outbox_cleanup`.
+OUTBOX_RETENTION_DAYS = env.int("OUTBOX_RETENTION_DAYS", default=7)
+# ProcessedEvent (idempotency) rows are kept this long; must exceed the
+# topics' retention so a redelivered message is still recognised.
+EVENTS_PROCESSED_RETENTION_DAYS = env.int("EVENTS_PROCESSED_RETENTION_DAYS", default=14)
+# In inline mode, process outbox rows right after their transaction commits.
+EVENTS_INLINE_DISPATCH = env.bool("EVENTS_INLINE_DISPATCH", default=True)
+
+# Background task retries (per attempt n = 1, 2, ...: delay = base *
+# multiplier^(n-1), +/- jitter, at most the max delay). EVENTS_RETRY_MAX_ATTEMPTS
+# counts every attempt, including the first; then the message goes to the DLQ.
+EVENTS_RETRY_MAX_ATTEMPTS = env.int("EVENTS_RETRY_MAX_ATTEMPTS", default=5)
+EVENTS_RETRY_BASE_DELAY = env.float("EVENTS_RETRY_BASE_DELAY", default=1.0)
+EVENTS_RETRY_MULTIPLIER = env.float("EVENTS_RETRY_MULTIPLIER", default=2.0)
+EVENTS_RETRY_MAX_DELAY = env.float("EVENTS_RETRY_MAX_DELAY", default=300.0)
+EVENTS_RETRY_JITTER = env.float("EVENTS_RETRY_JITTER", default=0.2)  # fraction of the delay
+# Extra exception classes (dotted paths) to retry or to dead-letter at once;
+# unknown exceptions are retried unless EVENTS_RETRY_UNKNOWN_ERRORS is False.
+EVENTS_RETRYABLE_EXCEPTIONS = env.list("EVENTS_RETRYABLE_EXCEPTIONS", default=[])
+EVENTS_NON_RETRYABLE_EXCEPTIONS = env.list("EVENTS_NON_RETRYABLE_EXCEPTIONS", default=[])
+EVENTS_RETRY_UNKNOWN_ERRORS = env.bool("EVENTS_RETRY_UNKNOWN_ERRORS", default=True)
+# Seconds one task may run before it is abandoned and retried.
+EVENTS_TASK_TIMEOUT = env.float("EVENTS_TASK_TIMEOUT", default=60.0)
+# Seconds a worker backs off a partition when it can't record a failure
+# (Kafka and PostgreSQL both unavailable); the message is redelivered.
+EVENTS_FORWARD_BACKOFF = env.float("EVENTS_FORWARD_BACKOFF", default=5.0)
+EVENTS_FORWARD_BACKOFF_MAX = env.float("EVENTS_FORWARD_BACKOFF_MAX", default=60.0)
+# A dead-lettered event may be replayed at most this many times.
+EVENTS_MAX_DLQ_REPLAYS = env.int("EVENTS_MAX_DLQ_REPLAYS", default=3)
+# Workers and the publisher record a heartbeat this often (seconds).
+EVENTS_HEARTBEAT_INTERVAL = env.float("EVENTS_HEARTBEAT_INTERVAL", default=10.0)
+# /api/health/events/ caches its Kafka view for this long (seconds).
+EVENTS_HEALTH_CACHE_SECONDS = env.float("EVENTS_HEALTH_CACHE_SECONDS", default=10.0)
+# Health thresholds: backlog age / heartbeat age (seconds), lag (messages).
+EVENTS_OUTBOX_MAX_AGE = env.float("EVENTS_OUTBOX_MAX_AGE", default=60.0)
+EVENTS_HEARTBEAT_STALE_AFTER = env.float("EVENTS_HEARTBEAT_STALE_AFTER", default=60.0)
+EVENTS_MAX_CONSUMER_LAG = env.int("EVENTS_MAX_CONSUMER_LAG", default=1000)
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +541,10 @@ REST_FRAMEWORK = {
     ],
     # Every error is answered as apps.common.custom_response.CustomResponse.
     "EXCEPTION_HANDLER": "apps.common.exceptions.custom_exception_handler",
+    # Throttling identifies clients by REMOTE_ADDR, which
+    # apps.common.proxy has already set from a trusted proxy's
+    # X-Forwarded-For (a client-sent X-Forwarded-For is never used).
+    "NUM_PROXIES": 0,
     "DEFAULT_THROTTLE_RATES": {
         "password_reset": env.str("PASSWORD_RESET_THROTTLE_RATE", default="5/hour"),
     },
@@ -414,12 +567,16 @@ LOGGING = {
             "format": "[{asctime}] {levelname} {name} {message}",
             "style": "{",
         },
+        # One JSON object per line, with the structured ``extra`` fields
+        # (event=..., topic=...) that apps.events and apps.db attach.
+        "json": {"()": "apps.common.logging.JsonFormatter"},
     },
     "handlers": {
         "console": {
             "level": "INFO",
             "class": "logging.StreamHandler",
-            "formatter": "verbose",
+            # LOG_FORMAT=json for log shippers; verbose text by default.
+            "formatter": env.str("LOG_FORMAT", default="verbose"),
         },
     },
     "root": {"handlers": ["console"], "level": "WARNING"},

@@ -13,6 +13,7 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
+from apps.events import outbox, topics
 from apps.orders.models import Order
 
 from ..models import Payment
@@ -200,9 +201,55 @@ def apply_result(payment_pk, result: Verification, source, verified=True):
             payment.failure_reason = "The payment was not completed in time"
 
         payment.save()
+        if payment.status != previous:
+            _enqueue_status_event(order, payment, previous, verified)
     if payment.status != previous:
         logger.info("Payment %s: %s -> %s (%s)", payment.payment_id, previous, payment.status, source)
     return payment
+
+
+# Payment status -> event for downstream work (emails, audit). Expired and
+# cancelled attempts need nobody's attention.
+STATUS_EVENTS = {
+    Payment.STATUS_PAID: "payment.succeeded",
+    Payment.STATUS_FAILED: "payment.failed",
+    Payment.STATUS_REFUNDED: "payment.refunded",
+}
+
+
+def _enqueue_status_event(order, payment, previous, verified):
+    """Write the payment's new status to the outbox, inside the transaction
+    that applied it: the event exists exactly when the change committed.
+
+    Only a server-side verified result can mark a payment PAID (a browser
+    redirect alone never does), so ``payment.succeeded`` is only ever
+    published for verified payments. No provider response, transaction id
+    or credentials go into the event.
+    """
+    event_type = STATUS_EVENTS.get(payment.status)
+    if event_type is None:
+        return
+    if payment.status == Payment.STATUS_PAID and not verified:
+        logger.error("Refusing to publish an unverified PAID status for payment %s", payment.payment_id)
+        return
+    outbox.enqueue(
+        event_type, topic=topics.PAYMENT_EVENTS, aggregate_type="payment", aggregate_id=payment.payment_id,
+        key=order.number,
+        payload={
+            "payment_id": payment.payment_id,
+            "order_number": order.number,
+            "user_id": order.user_id,
+            "method": payment.payment_method,
+            "status": payment.status,
+            "previous_status": previous,
+            "amount": payment.amount,
+            "currency": payment.currency,
+            "order_status": order.status,
+            "needs_refund": bool(payment.metadata.get("needs_refund")),
+            "needs_review": bool(payment.metadata.get("needs_review")),
+            "reason": payment.failure_reason[:120],
+        },
+    )
 
 
 def _apply_paid(order, payment, result, now):

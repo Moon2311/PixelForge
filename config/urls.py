@@ -6,12 +6,14 @@ from django.contrib import admin
 from django.urls import include, path
 
 from apps.common.views import ApiRootView, DatabaseHealthView, HealthCheckView
+from apps.events.views import EventsHealthView
 
 urlpatterns = [
     path("", ApiRootView.as_view(), name="api-root"),
     path("admin/", admin.site.urls),
     path("api/health/", HealthCheckView.as_view(), name="health-check"),
     path("api/health/database/", DatabaseHealthView.as_view(), name="database-health"),
+    path("api/health/events/", EventsHealthView.as_view(), name="events-health"),
     path("api/auth/", include("apps.authentication.urls")),
     path("api/catalog/", include("apps.catalog.urls")),
     path("api/search/", include("apps.search.urls")),

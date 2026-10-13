@@ -1,4 +1,5 @@
 import copy
+import logging
 
 from django.db import connections
 from django.test.runner import DiscoverRunner
@@ -14,7 +15,7 @@ class TestRunner(DiscoverRunner):
     """Runs the suite without Redis, as before Redis was added: Django's cache
     is in-process memory and apps.common.cache is off (every read goes to
     PostgreSQL). Cache tests opt in with
-    ``apps.common.testing.RedisCacheTestMixin``.
+    ``apps.common.testing.RedisCacheTestMixin``. Events use inline mode.
 
     Read-replica routing is off too (every read on the primary, as before).
     The ``TEST_REPLICA_ALIASES`` always exist as test mirrors of the
@@ -24,10 +25,17 @@ class TestRunner(DiscoverRunner):
 
     def setup_test_environment(self, **kwargs):
         super().setup_test_environment(**kwargs)
+        # Event pipeline logs (one line per event) would drown the test
+        # output; tests that check them use assertLogs.
+        logging.getLogger("apps.events").setLevel(logging.CRITICAL)
         self._no_redis = override_settings(
             CACHES={"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}},
             CACHE_ENABLED=False,
             READ_REPLICA_ENABLED=False,
+            # Events are processed in-process after commit (no Kafka);
+            # Kafka integration tests opt in (apps.events.tests.integration).
+            EVENTS_BACKEND="inline",
+            TRUSTED_PROXIES=[],
         )
         self._no_redis.enable()
         for alias in TEST_REPLICA_ALIASES:

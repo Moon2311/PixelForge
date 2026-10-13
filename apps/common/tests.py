@@ -9,8 +9,11 @@ class HealthCheckTest(TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.json()["data"]
         self.assertEqual(body["status"], "healthy")
-        self.assertEqual(set(body["checks"]), {"django", "database", "redis"})
+        self.assertEqual(set(body["checks"]), {"django", "database", "redis", "events"})
         self.assertEqual(body["checks"]["redis"]["status"], "disabled")  # test runner turns the cache off
+        self.assertEqual(body["checks"]["events"]["backend"], "inline")  # no Kafka in the test runner
+        self.assertEqual(body["checks"]["events"]["status"], "healthy")
+        self.assertIn("instance", body)
 
 
 class ApiRootTest(TestCase):

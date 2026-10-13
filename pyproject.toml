@@ -13,6 +13,8 @@ dependencies = [
     "gunicorn==23.0.0",
     "cryptography==50.0.2",
     "django-redis==7.0.0",
+    "confluent-kafka==2.15.1",
+    "pillow==12.3.0",
 ]
 
 [tool.uv]

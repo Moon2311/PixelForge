@@ -1,13 +1,20 @@
-import logging
+"""Password emails.
+
+The views only queue an event (``queue_*``); the ``notifications`` workers
+build and send the email (``*_message``). The request no longer waits for
+SMTP, and its timing no longer depends on whether the address matched an
+account. The reset token is generated when the email is built, so it never
+travels through Kafka or the outbox.
+"""
+
 from urllib.parse import urlencode
 
 from django.conf import settings
 from django.contrib.auth.tokens import default_token_generator
-from django.core.mail import send_mail
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 
-logger = logging.getLogger(__name__)
+from apps.events import outbox, topics
 
 
 def build_password_reset_link(user):
@@ -20,7 +27,7 @@ def build_password_reset_link(user):
     return f"{settings.PASSWORD_RESET_URL}?{query}"
 
 
-def send_password_reset_email(user):
+def password_reset_message(user):
     minutes = settings.PASSWORD_RESET_TIMEOUT // 60
     body = (
         f"Hi {user.first_name or user.username},\n\n"
@@ -30,21 +37,28 @@ def send_password_reset_email(user):
         f"This link expires in {minutes} minutes and can only be used once. "
         "If you didn't request a reset, you can ignore this email.\n"
     )
-    try:
-        send_mail("Reset your PixelForge password", body, None, [user.email])
-    except Exception:
-        # Never surface delivery failures to the caller; that would reveal
-        # whether the account exists.
-        logger.exception("Failed to send password reset email to user %s", user.pk)
+    return "Reset your PixelForge password", body
 
 
-def send_password_changed_email(user):
+def password_changed_message(user):
     body = (
         f"Hi {user.first_name or user.username},\n\n"
         "Your PixelForge password was just changed. If this wasn't you, "
         "reset your password immediately and contact support.\n"
     )
-    try:
-        send_mail("Your PixelForge password was changed", body, None, [user.email])
-    except Exception:
-        logger.exception("Failed to send password changed email to user %s", user.pk)
+    return "Your PixelForge password was changed", body
+
+
+def _queue(event_type, user):
+    outbox.enqueue(
+        event_type, topic=topics.NOTIFICATION_EVENTS, aggregate_type="user",
+        aggregate_id=user.pk, payload={"user_id": user.pk},
+    )
+
+
+def queue_password_reset_email(user):
+    _queue("notification.password_reset_requested", user)
+
+
+def queue_password_changed_email(user):
+    _queue("notification.password_changed", user)

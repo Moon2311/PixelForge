@@ -1,13 +1,15 @@
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
+from django.db import transaction
 from django.db.models import Q
 from rest_framework.permissions import AllowAny, IsAdminUser
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from apps.common.custom_response import CustomResponse
+from apps.events import outbox
 
 from .tokens import issue_token_pair, user_from_refresh_token
-from .emails import send_password_changed_email, send_password_reset_email
+from .emails import queue_password_changed_email, queue_password_reset_email
 from .serializers import (
     BuyerRegistrationSerializer,
     ForgotPasswordSerializer,
@@ -67,8 +69,13 @@ class LoginView(APIView):
                 request, username=account.username, password=password
             )
         if user is None:
+            # No identifier in the record: it may be someone else's email.
+            outbox.audit("audit.login_failed", aggregate_type="user",
+                         aggregate_id=account.pk if account else "", actor_user_id=None)
             return CustomResponse.failed_response("Invalid username or password", status=401)
         login(request, user)
+        outbox.audit("audit.login_succeeded", aggregate_type="user", aggregate_id=user.pk,
+                     actor_user_id=user.pk)
         return CustomResponse.successful_response(
             {
                 "user": UserSerializer(user).data,
@@ -101,8 +108,9 @@ class ForgotPasswordView(APIView):
     def post(self, request):
         serializer = ForgotPasswordSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        # Queued for the notification workers: no SMTP wait in the request.
         for user in get_password_reset_users(serializer.validated_data["email"]):
-            send_password_reset_email(user)
+            queue_password_reset_email(user)
         # Same response whether or not the email matched an account.
         return CustomResponse.successful_response(
             message="If an account exists for this email, a password reset link has been sent.",
@@ -117,8 +125,9 @@ class ResetPasswordView(APIView):
     def post(self, request):
         serializer = ResetPasswordSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
-        send_password_changed_email(user)
+        with transaction.atomic():
+            user = serializer.save()
+            queue_password_changed_email(user)
         return CustomResponse.successful_response(message="Password reset successfully")
 
 

@@ -27,6 +27,7 @@ from apps.catalog.models import (
     LowStockAlert,
     ProductVariant,
 )
+from apps.events import outbox, topics
 
 logger = logging.getLogger("catalog.inventory")
 
@@ -396,10 +397,26 @@ class InventoryManager:
             ).exists()
 
             if not exists:
-                LowStockAlert.objects.create(
+                alert = LowStockAlert.objects.create(
                     variant=inventory.variant,
                     threshold=inventory.low_stock_threshold,
                     quantity_at_alert=inventory.stock_quantity,
+                )
+                # In the stock change's transaction; staff are emailed by
+                # the notification workers, once per alert.
+                variant = inventory.variant
+                outbox.enqueue(
+                    "inventory.low_stock", topic=topics.INVENTORY_EVENTS, aggregate_type="variant",
+                    aggregate_id=variant.pk,
+                    payload={
+                        "alert_id": alert.pk,
+                        "variant_id": variant.pk,
+                        "product_id": variant.product_id,
+                        "product_name": variant.product.name,
+                        "sku": variant.sku,
+                        "quantity": inventory.stock_quantity,
+                        "threshold": inventory.low_stock_threshold,
+                    },
                 )
         else:
             # Resolve open alerts if stock is above threshold
