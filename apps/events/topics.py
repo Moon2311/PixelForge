@@ -6,6 +6,7 @@ jobs). Kafka orders messages only within a partition, never across them.
 
     order-events         order.placed                          key: order number
     payment-events       payment.succeeded/failed/refunded     key: order number
+    payment-processing   payment.verification_requested        key: order number
     inventory-events     inventory.low_stock                   key: variant id
     notification-events  notification.password_*               key: user id
     image-processing     image.uploaded                        key: file path
@@ -20,6 +21,8 @@ from django.conf import settings
 
 ORDER_EVENTS = "order-events"
 PAYMENT_EVENTS = "payment-events"
+# Work for the payments group: ask the provider what happened to a payment.
+PAYMENT_PROCESSING = "payment-processing"
 INVENTORY_EVENTS = "inventory-events"
 NOTIFICATION_EVENTS = "notification-events"
 IMAGE_PROCESSING = "image-processing"

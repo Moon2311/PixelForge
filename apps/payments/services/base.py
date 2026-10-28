@@ -25,11 +25,85 @@ from decimal import Decimal
 
 from django.conf import settings
 
+from apps.events.retry import NonRetryableError, RetryableError
+
 logger = logging.getLogger("apps.payments")
 
 
 class ProviderError(Exception):
-    """The provider couldn't be reached or gave an unusable answer."""
+    """The provider couldn't be reached or gave an unusable answer.
+
+    Subclasses classify the failure for retries and the circuit breaker
+    (``category`` for logs and metrics). ``retry_after``: seconds before a
+    retry makes sense, when known.
+    """
+
+    category = "provider_error"
+    # Counts as the gateway being unavailable (circuit breaker).
+    trips_circuit = False
+    retry_after = None
+
+
+class ProviderUnavailable(ProviderError, RetryableError):
+    """Connection refused/reset, DNS failure, HTTP 5xx: retry later."""
+
+    category = "unavailable"
+    trips_circuit = True
+
+
+class ProviderTimeout(ProviderUnavailable):
+    """No answer in PAYMENT_PROVIDER_TIMEOUT seconds. For an inquiry this is
+    only "ask again"; nothing was charged by asking."""
+
+    category = "timeout"
+
+
+class ProviderRateLimited(ProviderUnavailable):
+    """HTTP 429."""
+
+    category = "rate_limited"
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class CircuitOpen(ProviderUnavailable):
+    """The circuit breaker refused the call (the provider failed repeatedly);
+    nothing was sent."""
+
+    category = "circuit_open"
+    trips_circuit = False
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class ProviderResponseError(ProviderError, RetryableError):
+    """The provider answered, but not usably (invalid JSON or signature, an
+    error code, an unknown status): retried, without tripping the circuit."""
+
+    category = "bad_response"
+
+
+class ProviderAuthError(ProviderError, NonRetryableError):
+    """HTTP 401/403: our credentials or IP allow-listing are wrong.
+    Retrying can't fix it; an operator must."""
+
+    category = "auth"
+
+
+class ProviderConfigError(ProviderError, NonRetryableError):
+    """Our configuration is unusable (e.g. a hash key of the wrong length)."""
+
+    category = "config"
+
+
+class ProviderRequestError(ProviderError, NonRetryableError):
+    """HTTP 4xx other than 401/403/429: the provider rejected our request."""
+
+    category = "invalid_request"
 
 
 @dataclass(frozen=True)
@@ -73,13 +147,34 @@ def post_json(url, payload, headers=None):
         with urllib.request.urlopen(request, timeout=settings.PAYMENT_PROVIDER_TIMEOUT) as response:
             body = response.read()
     except urllib.error.HTTPError as exc:
-        raise ProviderError(f"HTTP {exc.code} from {url}") from None
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise ProviderError(f"Could not reach {url}: {exc}") from None
+        raise _http_error(exc, url) from None
+    except TimeoutError:
+        raise ProviderTimeout(f"No answer from {url} in {settings.PAYMENT_PROVIDER_TIMEOUT}s") from None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise ProviderTimeout(f"No answer from {url} in {settings.PAYMENT_PROVIDER_TIMEOUT}s") from None
+        raise ProviderUnavailable(f"Could not reach {url}: {exc.reason}") from None
+    except OSError as exc:
+        raise ProviderUnavailable(f"Could not reach {url}: {exc}") from None
     try:
         data = json.loads(body)
     except ValueError:
-        raise ProviderError(f"Invalid JSON from {url}") from None
+        raise ProviderResponseError(f"Invalid JSON from {url}") from None
     if not isinstance(data, dict):
-        raise ProviderError(f"Unexpected response from {url}")
+        raise ProviderResponseError(f"Unexpected response from {url}")
     return data
+
+
+def _http_error(exc, url):
+    code = exc.code
+    if code == 429:
+        try:
+            retry_after = float(exc.headers.get("Retry-After")) if exc.headers else None
+        except (TypeError, ValueError):
+            retry_after = None
+        return ProviderRateLimited(f"HTTP 429 from {url}", retry_after=retry_after)
+    if code in (401, 403):
+        return ProviderAuthError(f"HTTP {code} from {url}")
+    if code >= 500 or code in (408, 425):
+        return ProviderUnavailable(f"HTTP {code} from {url}")
+    return ProviderRequestError(f"HTTP {code} from {url}")

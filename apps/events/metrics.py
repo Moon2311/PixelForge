@@ -38,9 +38,17 @@ COUNTERS = (
     "inline_failures_total",
 )
 
+_extra_counters = []
 _counts = Counter()
 _latency = defaultdict(lambda: {"count": 0, "total_ms": 0.0, "max_ms": 0.0, "failures": 0})
 _lock = threading.Lock()
+
+
+def register(*names):
+    """Report more counters in ``snapshot()`` (other apps' pipeline metrics,
+    e.g. apps.payments.metrics), so worker heartbeats carry them too."""
+    with _lock:
+        _extra_counters.extend(n for n in names if n not in COUNTERS and n not in _extra_counters)
 
 
 def incr(name, amount=1):
@@ -70,7 +78,8 @@ def snapshot():
             }
             for task, s in _latency.items()
         }
-        return {"counters": {name: _counts[name] for name in COUNTERS}, "tasks": tasks}
+        names = (*COUNTERS, *_extra_counters)
+        return {"counters": {name: _counts[name] for name in names}, "tasks": tasks}
 
 
 def reset():

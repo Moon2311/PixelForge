@@ -35,6 +35,7 @@ import signal
 import threading
 import time
 import uuid
+from datetime import timedelta
 
 from confluent_kafka import KafkaError, KafkaException, TopicPartition
 from django.conf import settings
@@ -205,7 +206,13 @@ class Worker:
             "replay_count": int(prior.get("replay_count", 0)),
         }
         if outcome.retryable and event.attempt < policy.max_attempts:
-            failure["next_retry_at"] = policy.next_retry_at(now, event.attempt).isoformat()
+            due = policy.next_retry_at(now, event.attempt)
+            # An error may say when retrying makes sense (an open circuit
+            # breaker, a rate limit's Retry-After): never sooner than that.
+            retry_after = getattr(outcome.error, "retry_after", None)
+            if retry_after:
+                due = max(due, now + timedelta(seconds=min(float(retry_after), policy.max_delay)))
+            failure["next_retry_at"] = due.isoformat()
             return envelope.RETRY, self.retry_topic, failure
         failure["reason"] = RETRIES_EXHAUSTED if outcome.retryable else NON_RETRYABLE
         failure["dead_lettered_at"] = now.isoformat()

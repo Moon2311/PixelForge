@@ -334,6 +334,36 @@ PAYMENT_EXPIRY_MINUTES = env.int("PAYMENT_EXPIRY_MINUTES", default=30)
 # Timeout for server-to-server provider calls (seconds).
 PAYMENT_PROVIDER_TIMEOUT = env.int("PAYMENT_PROVIDER_TIMEOUT", default=20)
 
+# Fault tolerance (README "Payment outages"). Every status inquiry goes
+# through a per-provider circuit breaker; verification requests are queued
+# for the `payments` consumer group (topic payment-processing).
+# Consecutive gateway failures (timeouts, connection errors, HTTP 5xx/429)
+# that open the circuit.
+PAYMENT_CIRCUIT_FAILURE_THRESHOLD = env.int("PAYMENT_CIRCUIT_FAILURE_THRESHOLD", default=5)
+# Seconds the circuit stays open (calls fail fast) before probing again.
+PAYMENT_CIRCUIT_RECOVERY_SECONDS = env.float("PAYMENT_CIRCUIT_RECOVERY_SECONDS", default=30.0)
+# Successful half-open probes that close the circuit again; one probe at a time.
+PAYMENT_CIRCUIT_HALF_OPEN_SUCCESSES = env.int("PAYMENT_CIRCUIT_HALF_OPEN_SUCCESSES", default=2)
+# A provider is asked about the same payment at most this often (status
+# polling, reconciliation); provider notifications always trigger a check.
+PAYMENT_RECHECK_SECONDS = env.float("PAYMENT_RECHECK_SECONDS", default=10.0)
+# Verification task retries (payments consumer group): attempts including
+# the first, then the dead-letter topic. Backoff base * 2^(n-1) +/- jitter,
+# at most the max delay, and never sooner than an open circuit's recovery.
+PAYMENT_VERIFY_MAX_ATTEMPTS = env.int("PAYMENT_VERIFY_MAX_ATTEMPTS", default=8)
+PAYMENT_VERIFY_RETRY_BASE_DELAY = env.float("PAYMENT_VERIFY_RETRY_BASE_DELAY", default=5.0)
+PAYMENT_VERIFY_RETRY_MAX_DELAY = env.float("PAYMENT_VERIFY_RETRY_MAX_DELAY", default=300.0)
+# Reconciliation (`manage.py payments_reconcile`): every interval, re-check
+# PROCESSING/UNKNOWN payments not verified for PAYMENT_RECONCILE_AFTER
+# seconds and PENDING ones that expired that long ago.
+PAYMENT_RECONCILE_INTERVAL = env.float("PAYMENT_RECONCILE_INTERVAL", default=60.0)
+PAYMENT_RECONCILE_AFTER = env.float("PAYMENT_RECONCILE_AFTER", default=120.0)
+PAYMENT_RECONCILE_BATCH = env.int("PAYMENT_RECONCILE_BATCH", default=200)
+# An UNKNOWN payment still unresolved after this many seconds is flagged
+# for manual review (needs_review, ERROR log); it is never failed or retried
+# with a new charge automatically.
+PAYMENT_UNKNOWN_ESCALATE_AFTER = env.float("PAYMENT_UNKNOWN_ESCALATE_AFTER", default=3600.0)
+
 # JazzCash Online Payment Gateway (HTTP POST page redirection + Payment Inquiry).
 JAZZCASH_ENVIRONMENT = env.str("JAZZCASH_ENVIRONMENT", default="sandbox")  # sandbox | production
 JAZZCASH_MERCHANT_ID = env.str("JAZZCASH_MERCHANT_ID", default="")
@@ -432,6 +462,7 @@ KAFKA_TOPICS = {
     for name in (
         "order-events",
         "payment-events",
+        "payment-processing",
         "inventory-events",
         "notification-events",
         "image-processing",

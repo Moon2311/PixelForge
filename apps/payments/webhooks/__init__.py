@@ -2,15 +2,12 @@
 a provider) call. They carry no user session: nothing they receive is
 trusted until it has been verified with the provider."""
 
-import re
 from urllib.parse import urlencode
 
 from django.conf import settings
 from django.http import HttpResponseRedirect
 
-from ..models import Payment
-
-PAYMENT_ID_RE = re.compile(r"^PY[0-9A-F]{16}$")
+from ..models import PAYMENT_ID_RE, Payment
 
 
 def find_payment(reference, method):

@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from django.conf import settings
 
-from .base import ProviderError, Verification, post_json, redact
+from .base import ProviderConfigError, ProviderResponseError, Verification, post_json, redact
 
 PKT = ZoneInfo("Asia/Karachi")
 
@@ -80,7 +80,7 @@ def hashed_request(fields, hash_key=None):
     """``merchantHashedReq`` for the checkout ``fields``."""
     key = (_config()["hash_key"] if hash_key is None else hash_key).encode("utf-8")
     if len(key) not in (16, 24, 32):
-        raise ProviderError("EASYPAISA_HASH_KEY must be 16, 24 or 32 characters")
+        raise ProviderConfigError("EASYPAISA_HASH_KEY must be 16, 24 or 32 characters")
     message = "&".join(
         f"{name}={fields[name]}" for name in sorted(fields)
         if name != "merchantHashedReq" and str(fields[name]) != ""
@@ -155,14 +155,14 @@ def verify(payment):
     )
     code = str(data.get("responseCode") or "")
     if code != "0000":
-        raise ProviderError(f"Easypaisa inquiry failed: {code} {data.get('responseDesc', '')}".strip())
+        raise ProviderResponseError(f"Easypaisa inquiry failed: {code} {data.get('responseDesc', '')}".strip())
     if str(data.get("orderId") or payment.payment_id) != payment.payment_id:
-        raise ProviderError("Easypaisa inquiry answered for a different order")
+        raise ProviderResponseError("Easypaisa inquiry answered for a different order")
 
     transaction_status = str(data.get("transactionStatus") or "").upper()
     status = STATUSES.get(transaction_status)
     if status is None:
-        raise ProviderError(f"Unrecognised Easypaisa transaction status: {transaction_status or 'missing'}")
+        raise ProviderResponseError(f"Unrecognised Easypaisa transaction status: {transaction_status or 'missing'}")
     try:
         amount = Decimal(str(data["transactionAmount"])).quantize(Decimal("0.01"))
     except (KeyError, InvalidOperation, ValueError):

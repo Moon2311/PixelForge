@@ -48,6 +48,11 @@ GROUPS = {
         ),
         Group("images", (topics.IMAGE_PROCESSING,), "Product image optimisation"),
         Group(
+            "payments",
+            (topics.PAYMENT_PROCESSING,),
+            "Payment verification with JazzCash/Easypaisa (circuit breaker, retries, DLQ)",
+        ),
+        Group(
             "audit",
             (topics.ORDER_EVENTS, topics.PAYMENT_EVENTS, topics.INVENTORY_EVENTS, topics.AUDIT_EVENTS),
             "Audit trail in PostgreSQL",

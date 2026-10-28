@@ -9,5 +9,6 @@ urlpatterns = [
     path("jazzcash/ipn/", jazzcash.JazzCashIPNView.as_view(), name="jazzcash-ipn"),
     path("easypaisa/callback/", easypaisa.EasypaisaReturnView.as_view(), name="easypaisa-callback"),
     path("easypaisa/ipn/", easypaisa.EasypaisaIPNView.as_view(), name="easypaisa-ipn"),
+    path("<str:payment_id>/retry/", views.PaymentRetryView.as_view(), name="payment-retry"),
     path("<str:payment_id>/", views.PaymentDetailView.as_view(), name="payment-detail"),
 ]

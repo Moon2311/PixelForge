@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 from django.conf import settings
 from django.utils import timezone
 
-from .base import ProviderError, Verification, post_json, redact
+from .base import ProviderResponseError, Verification, post_json, redact
 
 PKT = ZoneInfo("Asia/Karachi")
 DATETIME_FORMAT = "%Y%m%d%H%M%S"
@@ -169,13 +169,13 @@ def verify(payment):
     data = post_json(config["inquiry_url"], payload)
 
     if data.get("pp_SecureHash") and not has_valid_hash(data):
-        raise ProviderError("JazzCash inquiry response has an invalid pp_SecureHash")
+        raise ProviderResponseError("JazzCash inquiry response has an invalid pp_SecureHash")
     code = str(data.get("pp_ResponseCode") or "")
     message = str(data.get("pp_ResponseMessage") or "")
     if code == NOT_FOUND_CODE:
         return Verification(status="PENDING", reason=message, raw=redact(data))
     if code and code != "000":
-        raise ProviderError(f"JazzCash inquiry failed: {code} {message}".strip())
+        raise ProviderResponseError(f"JazzCash inquiry failed: {code} {message}".strip())
 
     payment_code = str(data.get("pp_PaymentResponseCode") or "")
     if payment_code:
@@ -188,7 +188,7 @@ def verify(payment):
         status = {"completed": "PAID", "success": "PAID", "failed": "FAILED",
                   "pending": "PROCESSING"}.get(text)
         if status is None:
-            raise ProviderError(f"Unrecognised JazzCash inquiry status: {text or 'missing'}")
+            raise ProviderResponseError(f"Unrecognised JazzCash inquiry status: {text or 'missing'}")
         reason = "" if status == "PAID" else text
     return Verification(
         status=status,

@@ -2,7 +2,8 @@
 
 Nothing Easypay sends through the browser is signed, so these endpoints
 only tell us *which* payment to look at; its status always comes from the
-``inquire-transaction`` API.
+``inquire-transaction`` API, asked by the payment worker (these endpoints
+never wait on Easypaisa).
 """
 
 import logging
@@ -15,7 +16,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .. import services
-from ..models import Payment
+from ..models import Payment, PaymentNotification
 from ..services import easypaisa
 from . import find_payment, redirect_to_result
 
@@ -62,7 +63,11 @@ class EasypaisaReturnView(APIView):
         if payment is None:
             logger.warning("Easypaisa return for unknown payment %s", str(reference)[:20])
         else:
-            services.refresh(payment, include_closed=True)
+            query = request.query_params.dict()
+            services.handle_notification(
+                payment, provider_source="easypaisa_return", kind=PaymentNotification.SOURCE_RETURN,
+                fields=query, signature_valid=False, claims_success=query.get("status") == "0000",
+            )
         return redirect_to_result(payment)
 
 
@@ -91,5 +96,8 @@ class EasypaisaIPNView(APIView):
         payment = find_payment(reference, Payment.METHOD_EASYPAISA)
         if payment is None:
             return Response({"status": "UNKNOWN_ORDER"}, status=404)
-        payment = services.refresh(payment, include_closed=True)
+        services.handle_notification(
+            payment, provider_source="easypaisa_ipn", kind=PaymentNotification.SOURCE_IPN, fields=data,
+            signature_valid=False,
+        )
         return Response({"status": "OK", "orderRefNumber": payment.payment_id})

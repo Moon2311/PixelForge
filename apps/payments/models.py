@@ -1,3 +1,4 @@
+import re
 import secrets
 
 from django.db import models
@@ -5,6 +6,10 @@ from django.db.models import Q
 from django.utils import timezone
 
 from apps.orders.models import Order
+
+
+# Our payment reference: "PY" + 16 upper-case hex digits.
+PAYMENT_ID_RE = re.compile(r"^PY[0-9A-F]{16}$")
 
 
 def new_payment_id():
@@ -32,8 +37,16 @@ class Payment(models.Model):
         METHOD_EASYPAISA: Order.PAYMENT_EASYPAISA,
     }
 
+    # PENDING: the checkout is open; the customer still has to pay on the
+    # provider's page ("requires action").
     STATUS_PENDING = "PENDING"
+    # The provider reported the payment in progress, or told us it happened
+    # and we are confirming it with its inquiry API.
     STATUS_PROCESSING = "PROCESSING"
+    # The provider may have charged the customer but couldn't confirm it
+    # (inquiry timed out, gateway down). Never failed or charged again
+    # automatically: reconciliation asks the provider until it answers.
+    STATUS_UNKNOWN = "UNKNOWN"
     STATUS_PAID = "PAID"
     STATUS_FAILED = "FAILED"
     STATUS_CANCELLED = "CANCELLED"
@@ -42,6 +55,7 @@ class Payment(models.Model):
     STATUS_CHOICES = [
         (STATUS_PENDING, "Pending"),
         (STATUS_PROCESSING, "Processing"),
+        (STATUS_UNKNOWN, "Unknown (awaiting confirmation)"),
         (STATUS_PAID, "Paid"),
         (STATUS_FAILED, "Failed"),
         (STATUS_CANCELLED, "Cancelled"),
@@ -49,7 +63,8 @@ class Payment(models.Model):
         (STATUS_REFUNDED, "Refunded"),
     ]
     # Still waiting for the customer or the provider.
-    ACTIVE_STATUSES = (STATUS_PENDING, STATUS_PROCESSING)
+    ACTIVE_STATUSES = (STATUS_PENDING, STATUS_PROCESSING, STATUS_UNKNOWN)
+    FINAL_STATUSES = (STATUS_PAID, STATUS_FAILED, STATUS_CANCELLED, STATUS_EXPIRED, STATUS_REFUNDED)
 
     payment_id = models.CharField(max_length=20, unique=True, default=new_payment_id, editable=False)
     order = models.ForeignKey(Order, on_delete=models.PROTECT, related_name="payments")
@@ -68,11 +83,32 @@ class Payment(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     paid_at = models.DateTimeField(null=True, blank=True)
+    # Client-chosen key of the "Pay Now" request (Idempotency-Key header):
+    # repeating it returns this payment instead of starting another.
+    idempotency_key = models.CharField(max_length=64, blank=True, default="")
+    # Provider status inquiries made for this payment, and the last one
+    # that got an answer.
+    check_attempts = models.PositiveIntegerField(default=0)
+    last_checked_at = models.DateTimeField(null=True, blank=True)
+    # No new verification request before this time (throttles polling).
+    next_check_at = models.DateTimeField(null=True, blank=True)
+    # The last failed inquiry, sanitized (never credentials or responses).
+    last_error = models.CharField(max_length=255, blank=True, default="")
+    # When the payment became UNKNOWN, and when that was escalated.
+    unknown_since = models.DateTimeField(null=True, blank=True)
+    escalated_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         db_table = "apps_payment"
         ordering = ["-created_at", "-id"]
-        indexes = [models.Index(fields=["order", "status"])]
+        indexes = [
+            models.Index(fields=["order", "status"]),
+            # The reconciliation job's queue.
+            models.Index(
+                fields=["status", "last_checked_at"], name="payment_open_checked_idx",
+                condition=Q(status__in=["PENDING", "PROCESSING", "UNKNOWN"]),
+            ),
+        ]
         constraints = [
             # One provider transaction can only ever settle one payment.
             models.UniqueConstraint(
@@ -84,9 +120,20 @@ class Payment(models.Model):
             # double-clicked "Pay Now" can't open two provider checkouts.
             models.UniqueConstraint(
                 fields=["order"],
-                condition=Q(status__in=["PENDING", "PROCESSING"]),
+                condition=Q(status__in=["PENDING", "PROCESSING", "UNKNOWN"]),
                 name="payment_one_active_per_order",
             ),
+            models.UniqueConstraint(
+                fields=["order", "idempotency_key"],
+                condition=~Q(idempotency_key=""),
+                name="payment_unique_idempotency_key",
+            ),
+            # PAID always records when; only a PAID or REFUNDED payment has it.
+            models.CheckConstraint(
+                condition=(Q(status="PAID", paid_at__isnull=False) | ~Q(status="PAID")),
+                name="payment_paid_has_paid_at",
+            ),
+            models.CheckConstraint(condition=Q(amount__gt=0), name="payment_amount_positive"),
         ]
 
     def __str__(self):
@@ -95,3 +142,78 @@ class Payment(models.Model):
     @property
     def is_expired(self):
         return timezone.now() >= self.expires_at
+
+    @property
+    def is_final(self):
+        return self.status in self.FINAL_STATUSES
+
+
+class PaymentNotification(models.Model):
+    """A provider notification (browser return or IPN) that named one of our
+    payments, recorded once per distinct content.
+
+    Providers retry notifications and browsers get refreshed: a repeated
+    delivery only bumps ``receive_count``. A notification never changes a
+    payment's status on its own (the inquiry API is the authority); it is
+    kept for audit and duplicate detection. Only fields the provider sent,
+    without hashes or credentials (``base.redact``).
+    """
+
+    SOURCE_RETURN = "return"
+    SOURCE_IPN = "ipn"
+    SOURCE_CHOICES = [(SOURCE_RETURN, "Browser return"), (SOURCE_IPN, "IPN")]
+
+    provider = models.CharField(max_length=10, choices=Payment.METHOD_CHOICES)
+    source = models.CharField(max_length=10, choices=SOURCE_CHOICES)
+    payment = models.ForeignKey(Payment, on_delete=models.CASCADE, related_name="notifications")
+    # SHA-256 of the notification's content: the duplicate-delivery key.
+    dedupe_key = models.CharField(max_length=64)
+    # JazzCash: pp_SecureHash checked. Easypaisa notifications aren't signed.
+    signature_valid = models.BooleanField(default=False)
+    reported_status = models.CharField(max_length=10, blank=True, default="")
+    data = models.JSONField(default=dict, blank=True)
+    receive_count = models.PositiveIntegerField(default=1)
+    first_received_at = models.DateTimeField(default=timezone.now)
+    last_received_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "apps_payment_notification"
+        ordering = ["-first_received_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["provider", "dedupe_key"], name="payment_notification_unique"),
+        ]
+
+    def __str__(self):
+        return f"{self.provider} {self.source} for {self.payment_id} (x{self.receive_count})"
+
+
+class GatewayCircuit(models.Model):
+    """Circuit-breaker state of one provider's API, shared by every process
+    (web instances, payment workers, reconciler) through PostgreSQL.
+
+    CLOSED: calls go through; consecutive failures are counted.
+    OPEN: calls fail fast until ``opened_at`` + recovery time.
+    HALF_OPEN: one probe call at a time (``probe_until`` is its lease);
+    enough successes close the circuit, a failure opens it again.
+    """
+
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+    STATE_CHOICES = [(CLOSED, "Closed"), (OPEN, "Open"), (HALF_OPEN, "Half open")]
+
+    provider = models.CharField(max_length=10, primary_key=True, choices=Payment.METHOD_CHOICES)
+    state = models.CharField(max_length=10, choices=STATE_CHOICES, default=CLOSED)
+    consecutive_failures = models.PositiveIntegerField(default=0)
+    half_open_successes = models.PositiveIntegerField(default=0)
+    opened_at = models.DateTimeField(null=True, blank=True)
+    probe_until = models.DateTimeField(null=True, blank=True)
+    last_failure = models.CharField(max_length=255, blank=True, default="")
+    last_failure_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "apps_payment_gateway_circuit"
+
+    def __str__(self):
+        return f"{self.provider}: {self.state}"
